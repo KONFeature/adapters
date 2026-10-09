@@ -48,10 +48,38 @@ async fn main() -> io::Result<()> {
     steery_sdk::serve(|_notifier| Adapter::default()).await
 }
 
-/// The adapter: a Daytona client once `initialize` gave an API key, and none before.
+/// The adapter: a Daytona client once `initialize` gave an API key, and none before; and
+/// whether this computer has the OpenSSH client its channels run.
 #[derive(Default)]
 struct Adapter {
     daytona: OnceLock<Option<Daytona>>,
+    ssh: OnceLock<bool>,
+}
+
+/// Why no channel can be had here: Daytona's runs `ssh` on the controlling computer, and
+/// waiting does not install one. Said by `sandbox/channel`, and by `sandboxes/list`, the
+/// first call `machine add` makes, so the machine is never added where it cannot work.
+const NO_SSH: &str = "Daytona's channel runs `ssh` on this computer, and none is installed: install an OpenSSH client (e.g. apt install openssh-client)";
+
+impl Adapter {
+    /// `ssh` is on `PATH`, as found when the adapter was initialized.
+    fn reach(&self) -> Result<(), Error> {
+        let found = *self
+            .ssh
+            .get_or_init(|| std::env::var_os("PATH").is_some_and(|path| ssh_within(&path)));
+        found
+            .then_some(())
+            .ok_or_else(|| Error::refused(refusal::REFUSED, NO_SSH))
+    }
+}
+
+/// Whether a folder of `path` (as `PATH` spells it) holds an executable `ssh`.
+fn ssh_within(path: &std::ffi::OsStr) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path).any(|dir| {
+        std::fs::metadata(dir.join("ssh"))
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
 }
 
 impl Program for Adapter {
@@ -74,6 +102,7 @@ impl Program for Adapter {
             None => None,
         };
         let _ = self.daytona.set(daytona);
+        let _ = self.reach();
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
@@ -126,7 +155,10 @@ impl Program for Adapter {
             })
         };
         match method {
-            method::SANDBOXES_LIST => result(list(daytona()?, given(params)?).await?),
+            method::SANDBOXES_LIST => {
+                self.reach()?;
+                result(list(daytona()?, given(params)?).await?)
+            }
             method::SANDBOX_ENSURE => result(ensure(daytona()?, given(params)?).await?),
             method::SANDBOX_START => result(start(daytona()?, given(params)?).await?),
             method::SANDBOX_STOP => result(stop(daytona()?, given(params)?).await?),
@@ -134,7 +166,10 @@ impl Program for Adapter {
             method::SANDBOX_ARCHIVE => result(archive(daytona()?, given(params)?).await?),
             method::SANDBOX_KEEPALIVE => result(keepalive(daytona()?, given(params)?).await?),
             method::SANDBOX_PUT => result(put(daytona()?, given(params)?).await?),
-            method::SANDBOX_CHANNEL => result(channel(daytona()?, given(params)?).await?),
+            method::SANDBOX_CHANNEL => {
+                self.reach()?;
+                result(channel(daytona()?, given(params)?).await?)
+            }
             _ => Err(Error::Unknown),
         }
     }
@@ -590,5 +625,56 @@ mod tests {
             let (word, line) = listed(status, "").await;
             assert_eq!(word, refusal::OFFLINE, "{line}");
         }
+    }
+
+    /// Without `ssh` on this computer no channel can be had, so `sandbox/channel` refuses
+    /// `refused`, saying what to install, before it asks Daytona anything; and so does
+    /// `sandboxes/list`, the first call `machine add` makes.
+    #[tokio::test]
+    async fn without_an_ssh_client_a_channel_is_refused_saying_what_to_install() {
+        let without = Adapter {
+            daytona: OnceLock::from(None),
+            ssh: OnceLock::from(false),
+        };
+        let refused = |answer: Result<Value, Error>| match answer {
+            Err(Error::Refused { word, line }) => (word, line.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        };
+        let asked = serde_json::json!({"sandbox": "s", "command": ["steery", "serve"]});
+        for method in [method::SANDBOX_CHANNEL, method::SANDBOXES_LIST] {
+            let params = if method == method::SANDBOXES_LIST {
+                serde_json::json!({})
+            } else {
+                asked.clone()
+            };
+            assert_eq!(
+                refused(without.call(method, params).await),
+                (refusal::REFUSED.to_owned(), NO_SSH.to_owned()),
+                "{method}"
+            );
+        }
+        let with = Adapter {
+            daytona: OnceLock::from(None),
+            ssh: OnceLock::from(true),
+        };
+        let (_, line) = refused(with.call(method::SANDBOX_CHANNEL, asked).await);
+        assert!(line.contains("DAYTONA_API_KEY"), "{line}");
+    }
+
+    #[test]
+    fn an_ssh_client_is_found_on_path_only_where_it_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("steery-daytona-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (empty, held) = (dir.join("empty"), dir.join("held"));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&held).unwrap();
+        let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+        assert!(!ssh_within(&path(&[&empty])));
+        std::fs::write(held.join("ssh"), "#!/bin/sh\n").unwrap();
+        assert!(!ssh_within(&path(&[&empty, &held])), "not executable");
+        std::fs::set_permissions(held.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ssh_within(&path(&[&empty, &held])));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

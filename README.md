@@ -198,6 +198,13 @@ setting of its own, and leaves Daytona's auto-stop as the sandbox's idle timer.
   (`ssh.app.daytona.io`, or the host and port Daytona's answer names) with a 60-minute
   access token, running the runtime's command, quoted for the sandbox's shell.
 
+The channel runs `ssh` on the controlling computer, which carries the command's standard
+input and output byte for byte, so an OpenSSH client there is a prerequisite (`apt install
+openssh-client` on a bare Debian or Ubuntu). Where none is on `PATH`, `sandbox/channel` and
+`sandboxes/list` — the first call `steery machine add` makes, so nothing is written — refuse
+`refused`: "Daytona's channel runs `ssh` on this computer, and none is installed: install an
+OpenSSH client (e.g. apt install openssh-client)".
+
 It waits for Daytona inside the runtime's bounds: 280 s for `ensure`, `start`, `archive`
 and `put` (bound 300 s), 55 s for the rest (bound 60 s), and 5 s for each file call after
 an upload. Errors read as `not-found` (HTTP 404); `offline` where Daytona is down — not
