@@ -15,5 +15,8 @@ sha2 = "0.10"
 time = { version = "0.3", features = ["parsing"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util"] }
+
 # Its own workspace, so it builds alone.
 [workspace]

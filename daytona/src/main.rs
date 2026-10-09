@@ -119,7 +119,10 @@ impl Program for Adapter {
         use steery_sdk::{params as given, result};
         let daytona = || {
             self.daytona.get().and_then(Option::as_ref).ok_or_else(|| {
-                Error::refused(refusal::UNTRUSTED, "Daytona: DAYTONA_API_KEY is not set")
+                Error::refused(
+                    refusal::REFUSED,
+                    "Daytona: no API key was given: give DAYTONA_API_KEY",
+                )
             })
         };
         match method {
@@ -146,29 +149,34 @@ fn setting(name: &str, secret: bool, required: bool, about: &str) -> wire::Setti
     }
 }
 
-/// The refusal a fault is; `otherwise` where it is none of not found, auth, network or time.
-/// Its line never holds the API key.
+/// The refusal a fault is; `otherwise` where it is none of not found, key, down or time.
+/// A refused key is `refused`, never `offline`: it does not heal by waiting, and its line
+/// names the setting to give again. Its line never holds the API key.
 fn refuse(daytona: &Daytona, fault: Fault, otherwise: &'static str) -> Error {
     let (word, line) = match fault {
-        Fault::NotFound(line) => (refusal::NOT_FOUND, line),
-        Fault::Untrusted(line) => (refusal::UNTRUSTED, line),
-        Fault::Offline(line) => (refusal::OFFLINE, line),
-        // Daytona was reached: a call that ran out of time is not offline.
-        Fault::TimedOut(line) => (refusal::REFUSED, format!("{line} (timed out)")),
-        Fault::Conflict(line) | Fault::Failed(line) => (otherwise, line),
+        Fault::NotFound(line) => (refusal::NOT_FOUND, format!("Daytona: {line}")),
+        Fault::KeyRefused { status, said } => (
+            refusal::REFUSED,
+            format!(
+                "Daytona refused the API key (HTTP {status}: {said}): give DAYTONA_API_KEY again"
+            ),
+        ),
+        Fault::Offline(line) => (refusal::OFFLINE, format!("Daytona: {line}")),
+        // Daytona answered, and the sandbox was not there in time.
+        Fault::TimedOut(line) => (refusal::REFUSED, format!("Daytona: {line} (timed out)")),
+        Fault::Conflict(line) | Fault::Failed(line) => (otherwise, format!("Daytona: {line}")),
     };
     Error::refused(word, one_line(daytona.key(), &line))
 }
 
-/// `Daytona: <text>` on one line, without `key`, at most [`LINE_CHARS`] characters.
+/// `text` on one line, without `key`, at most [`LINE_CHARS`] characters.
 fn one_line(key: &str, text: &str) -> String {
     let text = text.replace(key, "[redacted]");
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let text = match text.char_indices().nth(LINE_CHARS - 1) {
+    match text.char_indices().nth(LINE_CHARS - 1) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text,
-    };
-    format!("Daytona: {text}")
+    }
 }
 
 /// A sandbox's id, never empty.
@@ -421,7 +429,9 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
         .ok_or_else(|| fail(Fault::TimedOut(format!("no time left for {path}"))))?;
     let timed_out = match daytona.upload(&toolbox, &path, content, within).await {
         Ok(()) => false,
-        Err(Fault::TimedOut(_)) => true,
+        // No answer by the method's own bound: the file is too large to carry in it, a
+        // partial file may be there, and waiting for Daytona would not help.
+        Err(Fault::Offline(_)) if deadline.left().is_none() => true,
         Err(fault) => return Err(fail(fault)),
     };
     let written = daytona
@@ -430,7 +440,7 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
         .unwrap_or(0);
     if timed_out || written != length {
         let why = if timed_out {
-            format!("the upload timed out after {LONG_SECONDS} s")
+            format!("the upload got no answer in {LONG_SECONDS} s")
         } else {
             "the upload ended short".to_owned()
         };
@@ -444,7 +454,7 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
             one_line(
                 daytona.key(),
                 &format!(
-                    "{why}: {path} had {written} of {length} bytes written; {removed} (fetch a large file from inside the sandbox)"
+                    "Daytona: {why}: {path} had {written} of {length} bytes written; {removed} (fetch a large file from inside the sandbox)"
                 ),
             ),
         ));
@@ -544,8 +554,41 @@ mod tests {
     #[test]
     fn keeps_the_key_out_of_a_line() {
         assert_eq!(
-            one_line("sk", "bad  key sk\nhere"),
+            one_line("sk", "Daytona: bad  key sk\nhere"),
             "Daytona: bad key [redacted] here"
         );
+    }
+
+    /// The refusal word and line `sandboxes/list` answers against a Daytona answering
+    /// `status` with `body`.
+    async fn listed(status: u16, body: &'static str) -> (String, String) {
+        let url = api::tests::daytona_answering(Some(status), body).await;
+        let daytona = Daytona::new("sk-secret".into(), Some(&url), None).unwrap();
+        match list(&daytona, sandbox::List { labels: None }).await {
+            Err(Error::Refused { word, line }) => (word, line.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_is_refused_and_names_the_setting_to_give_again() {
+        assert_eq!(
+            listed(401, r#"{"message":"Invalid API key sk-secret"}"#).await,
+            (
+                refusal::REFUSED.to_owned(),
+                "Daytona refused the API key (HTTP 401: Invalid API key [redacted]): give DAYTONA_API_KEY again"
+                    .to_owned()
+            )
+        );
+        let (word, _) = listed(403, r#"{"message":"Forbidden resource"}"#).await;
+        assert_eq!(word, refusal::REFUSED);
+    }
+
+    #[tokio::test]
+    async fn daytona_down_is_offline() {
+        for status in [502, 503, 504] {
+            let (word, line) = listed(status, "").await;
+            assert_eq!(word, refusal::OFFLINE, "{line}");
+        }
     }
 }

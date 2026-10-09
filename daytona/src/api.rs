@@ -22,11 +22,13 @@ const PAGE: u32 = 200;
 pub enum Fault {
     /// Daytona has no such sandbox or file (HTTP 404).
     NotFound(String),
-    /// Daytona refused the key (HTTP 401, 403).
-    Untrusted(String),
-    /// Daytona could not be reached.
+    /// Daytona refused the API key (HTTP 401, 403), and what it said: a key that does not
+    /// heal by waiting, given again by the person.
+    KeyRefused { status: u16, said: String },
+    /// Daytona is down: not reached, a gateway that answers for it (HTTP 502, 503, 504),
+    /// or a request that got no answer in its time.
     Offline(String),
-    /// Daytona was reached and did not finish in time.
+    /// Daytona answered, and the sandbox did not reach the state asked for in time.
     TimedOut(String),
     /// Daytona already has what was to be made: a sandbox by that name (HTTP 409).
     Conflict(String),
@@ -284,7 +286,7 @@ impl Daytona {
                 Err(Fault::NotFound(_)) if targets.contains(&"destroyed") => {
                     return Ok("destroyed".into());
                 }
-                Err(fault @ (Fault::NotFound(_) | Fault::Untrusted(_))) => return Err(fault),
+                Err(fault @ (Fault::NotFound(_) | Fault::KeyRefused { .. })) => return Err(fault),
                 Err(fault) => Err(fault),
             };
             let still = match reading {
@@ -301,11 +303,12 @@ impl Daytona {
                     }
                     state.to_owned()
                 }
-                Err(fault) if deadline.left().is_some() => {
+                // The last reading's own fault: Daytona down to the end is offline.
+                Err(fault) if deadline.left().is_none() => return Err(fault),
+                Err(fault) => {
                     eprintln!("daytona: reading sandbox {id} again: {fault:?}");
                     "unread".to_owned()
                 }
-                Err(fault) => return Err(fault),
             };
             let Some(left) = deadline.left() else {
                 return Err(Fault::TimedOut(format!(
@@ -413,13 +416,24 @@ async fn send(request: RequestBuilder) -> Result<Response, Fault> {
             body
         }
     });
+    Err(fault(status, message))
+}
+
+/// The fault an answer outside 2xx is, `message` being what Daytona said.
+fn fault(status: StatusCode, message: String) -> Fault {
     let line = format!("{message} (HTTP {})", status.as_u16());
-    Err(match status {
+    match status {
         StatusCode::NOT_FOUND => Fault::NotFound(line),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Fault::Untrusted(line),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Fault::KeyRefused {
+            status: status.as_u16(),
+            said: message,
+        },
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
+            Fault::Offline(line)
+        }
         StatusCode::CONFLICT => Fault::Conflict(line),
         _ => Fault::Failed(line),
-    })
+    }
 }
 
 /// The `message` of a Daytona error body: a string, or a list of them.
@@ -443,11 +457,12 @@ async fn json<T: DeserializeOwned>(response: Response) -> Result<T, Fault> {
         .map_err(|e| Fault::Failed(format!("an answer that does not read: {e}")))
 }
 
-/// A request that got no answer: out of time, or Daytona not reached.
+/// A request that got no answer: Daytona not reached, or not answering in its time; both
+/// are Daytona down (PROGRAMS.md §7).
 fn transport(error: reqwest::Error) -> Fault {
     let line = chain(&error);
     if error.is_timeout() {
-        Fault::TimedOut(line)
+        Fault::Offline(format!("{line} (no answer in time)"))
     } else if error.is_connect() || error.is_request() {
         Fault::Offline(line)
     } else {
@@ -465,4 +480,79 @@ fn chain(error: &dyn std::error::Error) -> String {
         cause = inner.source();
     }
     line
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    /// A Daytona on localhost that answers every request with `status` and `body`, or,
+    /// where `status` is none, takes every request and never answers. Its URL.
+    pub async fn daytona_answering(status: Option<u16>, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                match status {
+                    Some(status) => {
+                        let answer = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(answer.as_bytes()).await;
+                    }
+                    None => held.push(socket),
+                }
+            }
+        });
+        url
+    }
+
+    async fn fault_of(status: Option<u16>) -> Fault {
+        let url = daytona_answering(status, r#"{"message":"said"}"#).await;
+        let daytona = Daytona::new("sk".into(), Some(&url), None).unwrap();
+        let request = daytona.request(Method::GET, &url, Duration::from_millis(300));
+        send(request).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn daytona_down_behind_its_gateway_is_offline() {
+        for status in [502, 503, 504] {
+            let fault = fault_of(Some(status)).await;
+            assert!(
+                matches!(&fault, Fault::Offline(line) if line == &format!("said (HTTP {status})")),
+                "{fault:?}"
+            );
+        }
+        let fault = fault_of(None).await;
+        assert!(
+            matches!(&fault, Fault::Offline(line) if line.ends_with("(no answer in time)")),
+            "{fault:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_and_other_answers_read_as_their_faults() {
+        for status in [401, 403] {
+            let fault = fault_of(Some(status)).await;
+            assert!(
+                matches!(&fault, Fault::KeyRefused { status: got, said } if *got == status && said == "said"),
+                "{fault:?}"
+            );
+        }
+        assert!(matches!(fault_of(Some(404)).await, Fault::NotFound(_)));
+        assert!(matches!(fault_of(Some(409)).await, Fault::Conflict(_)));
+        assert!(matches!(fault_of(Some(500)).await, Fault::Failed(_)));
+    }
 }
