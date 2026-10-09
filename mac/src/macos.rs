@@ -10,13 +10,15 @@ use std::mem::size_of;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::ptr;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use libc::c_int;
-use steery_sdk::wire::process;
+use steery_sdk::wire::{self, process};
 use steery_sdk::{Error, refusal};
+use tokio::time::Instant;
 
 /// `PROC_PIDFDVNODEPATHINFO` of `sys/proc_info.h`, which libc does not declare.
 const PROC_PIDFDVNODEPATHINFO: c_int = 2;
@@ -29,9 +31,10 @@ struct VnodeFdInfoWithPath {
     path: libc::vnode_info_path,
 }
 
-/// Starts `argv` detached, in a session and process group of its own, so it outlives
-/// this adapter and the runtime: launchd kills only the stopped job's own process group.
-/// `scope` is ignored, since launchd has no user scopes like systemd's.
+/// Starts `argv` detached, in a session and process group of its own, with exactly the
+/// environment `env`, so it outlives this adapter and the runtime: launchd stops only the
+/// stopped job's own process group. `scope` is ignored: launchd has no share of the CPU
+/// to run it in.
 pub async fn start(start: process::Start) -> Result<process::Started, Error> {
     let Some((program, args)) = start.argv.split_first() else {
         return Err(Error::invalid("argv is empty"));
@@ -51,6 +54,7 @@ pub async fn start(start: process::Start) -> Result<process::Started, Error> {
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
+        .env_clear()
         .envs(&start.env)
         .current_dir(&start.cwd)
         .stdin(stdin)
@@ -90,8 +94,7 @@ fn append(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// Every process, or those of `pids` that exist. A process that ends while it is read,
-/// or that this user may not read, is left out.
+/// Every process running, or those of `pids` that run, as [`entry`] reads each.
 pub fn list(list: process::List) -> process::Listed {
     let pids = match list.pids {
         Some(pids) => pids,
@@ -129,13 +132,23 @@ fn all_pids() -> Vec<u32> {
         .collect()
 }
 
+/// One process: left out where it is a zombie, gone, or another user's whose arguments
+/// this user may not read; one of this user's whose arguments cannot be read is listed
+/// without them. Root reads every process's, and lists every process. `kernel_task`
+/// (pid 0) is no process to name.
 fn entry(
     pid: u32,
     users: &mut BTreeMap<u32, String>,
     buffer: &mut Vec<u8>,
 ) -> Option<process::Entry> {
-    let info = info(pid)?;
-    let args = procargs(pid, buffer)?.args;
+    if pid == 0 {
+        return None;
+    }
+    let info = info(pid).filter(|info| !info.zombie)?;
+    let args = procargs(pid, buffer).map(|procargs| procargs.args);
+    if args.is_none() && info.uid != *ME && *ME != 0 {
+        return None;
+    }
     let user = users
         .entry(info.uid)
         .or_insert_with(|| user_name(info.uid))
@@ -149,6 +162,12 @@ fn entry(
         user,
     })
 }
+
+/// The user this adapter runs as.
+static ME: LazyLock<u32> = LazyLock::new(|| {
+    // SAFETY: getuid takes nothing and cannot fail.
+    unsafe { libc::getuid() }
+});
 
 /// The user's name from the password database, else the number.
 fn user_name(uid: u32) -> String {
@@ -302,32 +321,81 @@ pub fn signal(signal: process::Signal) -> process::Sent {
     process::Sent { sent: code == 0 }
 }
 
-/// A LaunchAgent that runs the binary at login, restarted when it fails, and the
-/// commands that load it in this user's GUI domain, as the runtime writes its own.
+/// The seconds the runtime takes to stop once asked: its own shutdown grace, which its
+/// plist gives launchd before it kills it.
+const STOP_GRACE_SECS: u64 = 40;
+
+/// The longest `process/listening` waits on `lsof`, inside the runtime's 5 s bound.
+const LISTENING_BOUND: Duration = Duration::from_secs(4);
+
+/// The longest `service/status` waits on launchd, inside the runtime's 10 s bound.
+const STATUS_BOUND: Duration = Duration::from_secs(8);
+
+/// The longest `service/start`, `restart` and `remove` wait on launchd, inside the
+/// runtime's 30 s bound.
+const SERVICE_BOUND: Duration = Duration::from_secs(28);
+
+/// The processes listening on a TCP port, as `lsof` finds them. macOS shows a user only
+/// its own processes' sockets unless it runs as root.
+pub async fn listening(listening: process::Listening) -> Result<process::Listeners, Error> {
+    let deadline = Instant::now() + LISTENING_BOUND;
+    let port = format!("-iTCP:{}", listening.port);
+    let output = output(
+        "/usr/sbin/lsof",
+        &["-nP", &port, "-sTCP:LISTEN", "-Fp"],
+        deadline,
+    )
+    .await
+    .map_err(refused)?;
+    // `lsof` exits 1 when nothing listens; each process it found is a `p<pid>` line.
+    let pids: BTreeSet<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('p')?.parse().ok())
+        .collect();
+    let processes = pids
+        .into_iter()
+        .filter_map(|pid| {
+            let info = info(pid).filter(|info| !info.zombie)?;
+            Some(process::Listener {
+                pid,
+                process_start: info.start,
+                command: info.command,
+            })
+        })
+        .collect();
+    Ok(process::Listeners { processes })
+}
+
+/// A LaunchAgent, as the runtime installs itself: it runs the binary at login and keeps
+/// it running, handed its listener by launchd on 127.0.0.1:`port`, at a lower priority
+/// (macOS bounds a user's CPU no other way, so `cpu` is checked and has nothing to set),
+/// its output appended to `log`. It keeps every directory of the `PATH` the plist on
+/// disk gave it. The commands unload the job an earlier plist loaded, which fails where
+/// none is and may, enable it, which an earlier `launchctl disable` would otherwise keep
+/// from loading, and load it in this user's GUI domain.
 pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::Plan, Error> {
-    let label = &plan.label;
-    if label.is_empty()
-        || !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        return Err(Error::invalid(format!("{label:?} is not a launchd label")));
+    let label = launchd_label(&plan.label)?;
+    if !(1..=100).contains(&plan.cpu) {
+        return Err(Error::invalid(format!(
+            "cpu is a percent from 1 to 100, not {}",
+            plan.cpu
+        )));
     }
-    let binary = plan
-        .binary
-        .to_str()
-        .ok_or_else(|| Error::invalid("the binary's path is not UTF-8"))?;
-    let home_text = home
-        .to_str()
-        .ok_or_else(|| Error::invalid("the home's path is not UTF-8"))?;
-    let path = home.join(format!("Library/LaunchAgents/{label}.plist"));
-    let logs = format!("{home_text}/Library/Logs/{label}.log");
+    if plan.port == 0 {
+        return Err(Error::invalid("port 0 is no address to listen on"));
+    }
+    let binary = absolute_utf8(&plan.binary, "the binary")?;
+    let log = absolute_utf8(&plan.log, "the log")?;
+    let home_text = absolute_utf8(home, "the home")?;
+    let path = plist(home, label);
+    let mut env = plan.env;
+    let search = search_path(env.get("PATH").map(String::as_str), &path, binary);
+    env.insert("PATH".into(), search);
     let arguments: String = std::iter::once(binary)
         .chain(plan.args.iter().map(String::as_str))
         .map(|word| format!("    <string>{}</string>\n", escape(word)))
         .collect();
-    let environment: String = plan
-        .env
+    let environment: String = env
         .iter()
         .map(|(name, value)| {
             format!(
@@ -346,52 +414,307 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
 {arguments}  </array>
   <key>WorkingDirectory</key><string>{home}</string>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><dict>
-    <key>SuccessfulExit</key><false/>
-  </dict>
+  <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>{STOP_GRACE_SECS}</integer>
   <key>Nice</key><integer>10</integer>
-  <key>StandardOutPath</key><string>{logs}</string>
-  <key>StandardErrorPath</key><string>{logs}</string>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
   <key>EnvironmentVariables</key><dict>
 {environment}  </dict>
+  <key>Sockets</key><dict>
+    <key>Listeners</key><dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>{port}</string>
+      <key>SockType</key><string>stream</string>
+      <key>SockFamily</key><string>IPv4</string>
+    </dict>
+  </dict>
 </dict></plist>
 "#,
-        label = escape(label),
         home = escape(home_text),
-        logs = escape(&logs),
+        log = escape(log),
+        port = plan.port,
     );
-    // SAFETY: geteuid takes nothing and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    let domain = format!("gui/{uid}");
+    let target = target(label);
+    let launchctl = |args: &[&str], may_fail: bool| process::PlanCommand {
+        argv: std::iter::once("launchctl")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect(),
+        may_fail,
+    };
+    let commands = vec![
+        launchctl(&["bootout", &target], true),
+        launchctl(&["enable", &target], false),
+        launchctl(&["bootstrap", &domain(), &path.to_string_lossy()], false),
+    ];
     Ok(process::Plan {
         files: vec![process::PlannedFile {
-            path: path.clone(),
+            path,
             content,
             mode: 0o644,
         }],
-        commands: vec![
-            // Unloads the job an earlier plan loaded, so the new plist is read. It fails
-            // when no such job is loaded, as on the first install, and may.
-            process::PlanCommand {
-                argv: vec![
-                    "launchctl".into(),
-                    "bootout".into(),
-                    format!("{domain}/{label}"),
-                ],
-                may_fail: true,
-            },
-            process::PlanCommand {
-                argv: vec![
-                    "launchctl".into(),
-                    "bootstrap".into(),
-                    domain,
-                    path.to_string_lossy().into_owned(),
-                ],
-                may_fail: false,
-            },
-        ],
+        commands,
     })
+}
+
+/// Whether the agent's plist is on disk, whether launchd runs it and as which process,
+/// and the CPU this Mac grants the user: all its online cores.
+pub async fn service_status(
+    home: &Path,
+    service: process::Service,
+) -> Result<process::Status, Error> {
+    let label = launchd_label(&service.label)?;
+    let installed = plist(home, label).is_file();
+    let deadline = Instant::now() + STATUS_BOUND;
+    let pid = match printed(&target(label), deadline).await {
+        Ok(Some(printed)) => printed.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("pid = ")?
+                .parse::<u32>()
+                .ok()
+                .filter(|pid| *pid != 0)
+        }),
+        Ok(None) => None,
+        // launchd could not be asked, and nothing of the agent's is on disk.
+        Err(_) if !installed => None,
+        Err(line) => return Err(refused(line)),
+    };
+    let process_start = pid
+        .and_then(info)
+        .filter(|info| !info.zombie)
+        .map(|info| info.start);
+    // SAFETY: sysconf reads a constant of the running system.
+    let online = u32::try_from(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) })
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    Ok(process::Status {
+        installed,
+        running: process_start.is_some(),
+        pid: process_start.and(pid),
+        process_start,
+        granted: online.saturating_mul(100),
+    })
+}
+
+/// Has launchd run the agent: `kickstart` where its job is loaded (`-k` stops it first,
+/// for a restart), else loads it from its plist, which runs it at load. launchd stops only
+/// a job's own process group, so the turns it started in theirs keep running.
+pub async fn service_start(
+    home: &Path,
+    service: process::Service,
+    restart: bool,
+) -> Result<wire::Empty, Error> {
+    let label = launchd_label(&service.label)?;
+    let target = target(label);
+    let deadline = Instant::now() + SERVICE_BOUND;
+    if loaded(&target, deadline).await.map_err(refused)? {
+        let args: &[&str] = if restart {
+            &["kickstart", "-k", &target]
+        } else {
+            &["kickstart", &target]
+        };
+        run("launchctl", args, deadline).await.map_err(refused)?;
+        return Ok(wire::Empty {});
+    }
+    let path = plist(home, label);
+    if !path.is_file() {
+        return Err(refused(format!(
+            "{label} is not installed: {} is not there",
+            path.display()
+        )));
+    }
+    run("launchctl", &["enable", &target], deadline)
+        .await
+        .map_err(refused)?;
+    run(
+        "launchctl",
+        &["bootstrap", &domain(), &path.to_string_lossy()],
+        deadline,
+    )
+    .await
+    .map_err(refused)?;
+    Ok(wire::Empty {})
+}
+
+/// Removes the plist, then unloads the job, as the runtime uninstalls itself: the file
+/// first, since unloading stops the runtime that may be asking, and a plist left on disk
+/// is one launchd loads again at the next login. A job that is gone by the time it is
+/// unloaded is unloaded.
+pub async fn service_remove(home: &Path, service: process::Service) -> Result<wire::Empty, Error> {
+    let label = launchd_label(&service.label)?;
+    let path = plist(home, label);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(refused(format!("removing {}: {e}", path.display()))),
+    }
+    let target = target(label);
+    let deadline = Instant::now() + SERVICE_BOUND;
+    if !loaded(&target, deadline).await.map_err(refused)? {
+        return Ok(wire::Empty {});
+    }
+    if let Err(line) = run("launchctl", &["bootout", &target], deadline).await
+        && loaded(&target, deadline).await.map_err(refused)?
+    {
+        return Err(refused(line));
+    }
+    Ok(wire::Empty {})
+}
+
+/// `label` as a launchd label: letters, digits and `-_.`.
+fn launchd_label(label: &str) -> Result<&str, Error> {
+    let fits = !label.is_empty()
+        && label.len() <= 200
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if fits {
+        Ok(label)
+    } else {
+        Err(Error::invalid(format!("{label:?} is not a launchd label")))
+    }
+}
+
+/// The agent's plist.
+fn plist(home: &Path, label: &str) -> PathBuf {
+    home.join(format!("Library/LaunchAgents/{label}.plist"))
+}
+
+/// This user's GUI domain.
+fn domain() -> String {
+    // SAFETY: geteuid takes nothing and cannot fail.
+    format!("gui/{}", unsafe { libc::geteuid() })
+}
+
+/// The agent's job in this user's GUI domain.
+fn target(label: &str) -> String {
+    format!("{}/{label}", domain())
+}
+
+/// `path` as UTF-8 text, refused unless it is absolute.
+fn absolute_utf8<'a>(path: &'a Path, what: &str) -> Result<&'a str, Error> {
+    if !path.is_absolute() {
+        return Err(Error::invalid(format!("{what}'s path is not absolute")));
+    }
+    path.to_str()
+        .ok_or_else(|| Error::invalid(format!("{what}'s path is not UTF-8")))
+}
+
+/// The `PATH` the agent runs with: the one asked for (else this adapter's own, which is
+/// the runtime's), then every directory the plist on disk at `plist` gave it, then the
+/// binary's own directory, each once, in that order, so an install never narrows it.
+fn search_path(asked: Option<&str>, plist: &Path, binary: &str) -> String {
+    let own = std::env::var("PATH").unwrap_or_default();
+    let installed = std::fs::read_to_string(plist)
+        .ok()
+        .and_then(|body| plist_path(&body))
+        .unwrap_or_default();
+    let beside = Path::new(binary)
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or_default();
+    let mut kept: Vec<&str> = Vec::new();
+    for dir in asked
+        .unwrap_or(&own)
+        .split(':')
+        .chain(installed.split(':'))
+        .chain(std::iter::once(beside))
+    {
+        if !dir.is_empty() && !kept.contains(&dir) {
+            kept.push(dir);
+        }
+    }
+    kept.join(":")
+}
+
+/// The `PATH` string of a plist's environment, read back as [`escape`] wrote it.
+fn plist_path(body: &str) -> Option<String> {
+    const PATH: &str = "<key>PATH</key><string>";
+    let value = &body[body.find(PATH)? + PATH.len()..];
+    let value = &value[..value.find("</string>")?];
+    Some(
+        value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Whether launchd has `target` loaded: `print` answers for a loaded job and says
+/// `Could not find service` for one that is not; anything else is no answer.
+async fn loaded(target: &str, deadline: Instant) -> Result<bool, String> {
+    printed(target, deadline)
+        .await
+        .map(|printed| printed.is_some())
+}
+
+/// What `launchctl print` says of a loaded `target`; `None` where it is not loaded.
+async fn printed(target: &str, deadline: Instant) -> Result<Option<String>, String> {
+    let args = ["print", target];
+    let output = output("launchctl", &args, deadline).await?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+    if String::from_utf8_lossy(&output.stderr).contains("Could not find service") {
+        return Ok(None);
+    }
+    Err(failed("launchctl", &args, &output))
+}
+
+/// Runs `program` with `args` to its end before `deadline`, refused unless it succeeds,
+/// with one line saying how it failed: launchd's own words where it said any.
+async fn run(program: &str, args: &[&str], deadline: Instant) -> Result<(), String> {
+    let output = output(program, args, deadline).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(failed(program, args, &output))
+    }
+}
+
+/// Runs `program` with `args` to its end before `deadline`, whatever its exit status.
+async fn output(program: &str, args: &[&str], deadline: Instant) -> Result<Output, String> {
+    let command = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout_at(deadline, command).await {
+        Err(_) => Err(format!(
+            "`{program} {}` did not finish in time",
+            args.join(" ")
+        )),
+        Ok(Err(e)) => Err(format!("`{program} {}`: {e}", args.join(" "))),
+        Ok(Ok(output)) => Ok(output),
+    }
+}
+
+/// How a command failed, in one line: its standard error, or its exit status where it
+/// said nothing.
+fn failed(program: &str, args: &[&str], output: &Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr);
+    let said = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let said = if said.is_empty() {
+        output.status.to_string()
+    } else {
+        said
+    };
+    format!("`{program} {}` failed: {said}", args.join(" "))
+}
+
+/// Refused `refused` with launchd's line.
+fn refused(line: String) -> Error {
+    Error::refused(refusal::REFUSED, line)
 }
 
 /// The five characters an XML document cannot carry raw. Every value written into the
@@ -414,8 +737,10 @@ fn escape(value: &str) -> String {
 /// What `proc_pidinfo(PROC_PIDTBSDINFO)` gives this adapter.
 struct Info {
     ppid: u32,
-    /// The real user.
+    /// The effective user.
     uid: u32,
+    /// It exited and waits to be reaped.
+    zombie: bool,
     /// Milliseconds since 1970.
     start: u64,
     command: String,
@@ -441,7 +766,8 @@ fn info(pid: u32) -> Option<Info> {
     };
     Some(Info {
         ppid: bsd.pbi_ppid,
-        uid: bsd.pbi_ruid,
+        uid: bsd.pbi_uid,
+        zombie: bsd.pbi_status == libc::SZOMB,
         start: bsd.pbi_start_tvsec * 1000 + bsd.pbi_start_tvusec / 1000,
         command: String::from_utf8_lossy(&bytes_of(name)).into_owned(),
     })
@@ -527,10 +853,10 @@ static ARGMAX: LazyLock<usize> = LazyLock::new(|| {
     }
 });
 
-/// Refused `not-found` unless the pid exists with a start time within
+/// Refused `not-found` unless the pid runs, no zombie, with a start time within
 /// `SAME_START_MS` of the given one.
 fn same(pid: u32, process_start: u64) -> Result<(), Error> {
-    match info(pid) {
+    match info(pid).filter(|info| !info.zombie) {
         Some(info) if info.start.abs_diff(process_start) <= process::SAME_START_MS => Ok(()),
         Some(_) => Err(Error::refused(
             refusal::NOT_FOUND,

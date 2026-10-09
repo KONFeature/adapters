@@ -30,23 +30,64 @@ steery adapter test target/debug/steery-adapter-linux
 
 ## linux
 
-`linux/` provides `processes` on Linux: it starts turns detached (in a systemd user scope
-when one is reachable), lists processes and reads their environment and open files from
-`/proc`, signals only a process whose start time still matches, and plans the systemd
-user unit that keeps the runtime running. It ships with `steery` and updates with it.
-It speaks the program protocol over standard input and output through `steery-sdk`.
+`linux/` provides `processes` on Linux (`initialize` answers
+`machine: {provides: "processes", os: "linux", service: "systemd"}`). It ships with
+`steery` and updates with it, and speaks the program protocol over standard input and
+output through `steery-sdk`.
+
+- `process/start` starts a turn detached, in a session of its own, with exactly the
+  environment it is given. With a `scope` naming the service the runtime runs as under
+  systemd (the runtime's cgroup is `<label>.service`), it runs in a transient scope in
+  `<label>.slice` (`systemd-run --user --scope --slice=<label>.slice`), under the slice's
+  CPU quota and outside the runtime's unit; anywhere else it runs as it is.
+- `process/list` reads `/proc`; a zombie is not listed, and `args` is absent where `/proc`
+  hides a process's command line. `process/environ` and `process/files` read `/proc`, and
+  `process/signal` signals only a process whose start time still matches.
+- `process/listening` finds the `LISTEN` sockets on the port in `/proc/net/tcp` and `tcp6`
+  and the processes holding them under `/proc/<pid>/fd`.
+- `service/plan` writes three systemd user units, as the runtime installs itself:
+  `<label>.service` (the binary, `Restart=always`, `KillMode=process`, output appended to
+  `log`, the `PATH` asked for merged with the one the unit on disk gave), `<label>.socket`
+  (`ListenStream=127.0.0.1:<port>`, handed to the runtime) and `<label>.slice`
+  (`CPUQuota` of `cpu` percent of what the computer grants). Its commands reload systemd,
+  enable the socket and the service, bind the socket again only where its unit changed,
+  and `loginctl enable-linger`, which may fail.
+- `service/status` answers whether the unit is on disk and systemd runs it, its pid, and
+  `granted`: online cores, narrowed by the CPU affinity and every cgroup v1 or v2 quota
+  above the runtime's own slice, in percent of one core.
+- `service/start` starts the service; `service/restart` stops it, moves what it left in
+  its cgroup (turns, kept by `KillMode=process`) into a scope of their own in the slice,
+  and starts it; `service/remove` disables and removes the service, then the socket, then
+  the slice's file, never stopping the slice or a turn. Each refuses `refused` with
+  systemd's line.
 
 ## mac
 
-`mac/` provides `processes` on macOS: it starts turns detached in a session of their own,
-lists processes through libproc and reads their arguments and environment through
-`sysctl` (`KERN_PROCARGS2`) and their open files through `proc_pidfdinfo`, signals only a
-process whose start time still matches, and plans the LaunchAgent that keeps the runtime
-running (`~/Library/LaunchAgents/<label>.plist`, logs in `~/Library/Logs/<label>.log`),
-loaded with `launchctl bootstrap gui/<uid>`. launchd has no user scopes, so a start's
-`scope` is ignored. macOS lets a user read only its own processes' details, so another
-user's processes are left out unless it runs as root. It ships with `steery` and updates
-with it. Built for another system it answers `initialize` and refuses every method.
+`mac/` provides `processes` on macOS (`initialize` answers
+`machine: {provides: "processes", os: "macos", service: "launchd"}`). It ships with
+`steery` and updates with it. Built for another system it answers `initialize` and
+refuses every method.
+
+- `process/start` starts a turn detached, in a session of its own, with exactly the
+  environment it is given. launchd has no share of the CPU to run it in, so `scope` is
+  ignored.
+- `process/list` reads processes through libproc and their arguments and environment
+  through `sysctl` (`KERN_PROCARGS2`). A zombie is not listed. One of this user's whose
+  arguments cannot be read is listed without `args`; another user's is left out unless
+  the adapter runs as root. `process/files` reads `proc_pidfdinfo`, and `process/signal`
+  signals only a process whose start time still matches.
+- `process/listening` asks `lsof -iTCP:<port> -sTCP:LISTEN`.
+- `service/plan` writes the LaunchAgent `~/Library/LaunchAgents/<label>.plist`, as the
+  runtime installs itself: `KeepAlive`, a lower priority, output appended to `log`, the
+  `PATH` asked for merged with the one the plist on disk gave, and a `Listeners` socket on
+  127.0.0.1:`port` handed to the runtime. Its commands are `launchctl bootout` (which may
+  fail), `enable` and `bootstrap gui/<uid>`.
+- `service/status` answers whether the plist is on disk and launchd runs the job, its pid,
+  and `granted`: every online core, in percent of one core.
+- `service/start` and `service/restart` `launchctl kickstart` the job (`-k` to restart),
+  or load it from its plist where it is not loaded; launchd stops only the job's own
+  process group, so turns keep running. `service/remove` removes the plist, then boots
+  the job out. Each refuses `refused` with launchd's line.
 
 ## daytona
 
