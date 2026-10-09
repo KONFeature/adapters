@@ -126,6 +126,9 @@ async fn start(start: process::Start) -> Result<process::Started, Error> {
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr);
+    if let Some(what) = &start.started {
+        command.env("STEERY_STARTED", format!("{}:{what}", std::process::id()));
+    }
     // SAFETY: setsid is async-signal-safe, and the closure touches nothing else.
     unsafe {
         command.pre_exec(|| {
@@ -145,10 +148,42 @@ async fn start(start: process::Start) -> Result<process::Started, Error> {
     let process_start = stat(pid)
         .map(|stat| stat.start)
         .ok_or_else(|| Error::refused(refusal::START_FAILED, "its start time is unreadable"))?;
+    let status = start.status;
     tokio::spawn(async move {
-        let _ = child.wait().await;
+        if let (Ok(ended), Some(path)) = (child.wait().await, status) {
+            write_ended(&path, ended);
+        }
     });
     Ok(process::Started { pid, process_start })
+}
+
+/// Writes how a reaped child ended to `path`, mode 0600, whole: through a file beside it
+/// renamed over it. A failure is the reader's to see as no file.
+fn write_ended(path: &Path, ended: ExitStatus) {
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    let ended = match (ended.code(), ended.signal()) {
+        (Some(code), _) => process::Ended::Code(code),
+        (None, Some(signal)) => process::Ended::Signal(signal),
+        (None, None) => return,
+    };
+    let Ok(said) = serde_json::to_vec(&ended) else {
+        return;
+    };
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".writing");
+    let beside = PathBuf::from(beside);
+    let written = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&beside)
+        .and_then(|mut file| file.write_all(&said))
+        .and_then(|()| fs::rename(&beside, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&beside);
+    }
 }
 
 /// `argv` in a transient scope of its own in `label`'s slice.
@@ -237,10 +272,12 @@ fn entry(pid: u32, users: &mut BTreeMap<u32, String>) -> Option<process::Entry> 
     Some(process::Entry {
         pid,
         ppid: stat.ppid,
+        pgid: stat.pgid,
         process_start: stat.start,
         command,
         args,
         user,
+        stopped: stat.stopped(),
         // Unreadable for another user's process unless this runs as root.
         cwd: fs::read_link(format!("/proc/{pid}/cwd")).ok(),
     })
@@ -304,13 +341,20 @@ fn environ(environ: process::Environ) -> Result<process::Values, Error> {
     Ok(process::Values { values })
 }
 
-/// The files a process holds open: each descriptor that names an absolute path.
+/// The files a process holds open: each descriptor that names an absolute path, only
+/// those open for writing where `writing`. A process forked and not exec'd since holds
+/// its parent's copies, so it answers none.
 fn files(files: process::Files) -> Result<process::Paths, Error> {
+    let stat = stat(files.pid).filter(Stat::running);
     same(files.pid, files.process_start)?;
+    if stat.is_some_and(|stat| stat.unexeced()) {
+        return Ok(process::Paths { paths: Vec::new() });
+    }
     let fds = fs::read_dir(format!("/proc/{}/fd", files.pid))
         .map_err(|e| Error::refused(refusal::NOT_FOUND, format!("its descriptors: {e}")))?;
     let paths: BTreeSet<PathBuf> = fds
         .flatten()
+        .filter(|fd| !files.writing || writes(files.pid, &fd.file_name()))
         .filter_map(|fd| fs::read_link(fd.path()).ok())
         .filter(|path| path.is_absolute())
         .collect();
@@ -318,6 +362,18 @@ fn files(files: process::Files) -> Result<process::Paths, Error> {
     Ok(process::Paths {
         paths: paths.into_iter().collect(),
     })
+}
+
+/// Whether descriptor `fd` of `pid` is open for writing: its `flags` in
+/// `/proc/<pid>/fdinfo/<fd>` (octal) have an access mode other than `O_RDONLY`.
+fn writes(pid: u32, fd: &std::ffi::OsStr) -> bool {
+    let Ok(info) = fs::read_to_string(Path::new(&format!("/proc/{pid}/fdinfo")).join(fd)) else {
+        return false;
+    };
+    info.lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .and_then(|flags| u32::from_str_radix(flags.trim(), 8).ok())
+        .is_some_and(|flags| flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32)
 }
 
 /// The processes listening on a TCP port: the `LISTEN` sockets of `/proc/net/tcp` and
@@ -1003,33 +1059,56 @@ fn quota_at(dir: &Path) -> Option<u64> {
 
 /// What `/proc/<pid>/stat` gives this adapter.
 struct Stat {
-    /// The state letter: `Z` a zombie, `X` dead.
+    /// The state letter: `Z` a zombie, `X` dead, `T` stopped.
     state: char,
     ppid: u32,
+    /// Its process group.
+    pgid: u32,
+    /// The kernel's `PF_*` flags.
+    flags: u64,
     /// Milliseconds since 1970.
     start: u64,
 }
+
+/// `PF_FORKNOEXEC` of `linux/sched.h`: forked and not exec'd since.
+const PF_FORKNOEXEC: u64 = 0x40;
 
 impl Stat {
     /// Whether it still runs: no zombie, not dead.
     fn running(&self) -> bool {
         !matches!(self.state, 'Z' | 'X' | 'x')
     }
+
+    /// Whether it is stopped by a signal (Ctrl-Z, SIGSTOP).
+    fn stopped(&self) -> bool {
+        self.state == 'T'
+    }
+
+    /// Whether it was forked and has not exec'd since, so its descriptors are its
+    /// parent's copies.
+    fn unexeced(&self) -> bool {
+        self.flags & PF_FORKNOEXEC != 0
+    }
 }
 
-/// Reads fields 3 (state), 4 (ppid) and 22 (start time in clock ticks since boot),
-/// counted after the last `)`, since the command name may hold spaces and parentheses.
+/// Reads fields 3 (state), 4 (ppid), 5 (pgrp), 9 (flags) and 22 (start time in clock
+/// ticks since boot), counted after the last `)`, since the command name may hold spaces
+/// and parentheses.
 fn stat(pid: u32) -> Option<Stat> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = &text[text.rfind(')')? + 1..];
     let mut fields = rest.split_whitespace();
     let state = fields.next()?.chars().next()?;
     let ppid = fields.next()?.parse().ok()?;
-    let ticks: u64 = fields.nth(17)?.parse().ok()?;
+    let pgid = fields.next()?.parse().ok()?;
+    let flags = fields.nth(3)?.parse().ok()?;
+    let ticks: u64 = fields.nth(12)?.parse().ok()?;
     let (boot, tick) = (*CLOCK)?;
     Some(Stat {
         state,
         ppid,
+        pgid,
+        flags,
         start: boot + ticks * 1000 / tick,
     })
 }

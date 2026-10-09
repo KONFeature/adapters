@@ -23,11 +23,26 @@ use tokio::time::Instant;
 /// `PROC_PIDFDVNODEPATHINFO` of `sys/proc_info.h`, which libc does not declare.
 const PROC_PIDFDVNODEPATHINFO: c_int = 2;
 
+/// `PROC_FLAG_EXEC` of `sys/proc_info.h`: the process has called exec.
+const PROC_FLAG_EXEC: u32 = 0x4000;
+
+/// `FWRITE` of `sys/fcntl.h`: a descriptor open for writing.
+const FWRITE: u32 = 0x0002;
+
+/// `struct proc_fileinfo` of `sys/proc_info.h`, which libc does not declare.
+#[repr(C)]
+struct ProcFileInfo {
+    fi_openflags: u32,
+    _fi_status: u32,
+    _fi_offset: i64,
+    _fi_type: i32,
+    _fi_guardflags: u32,
+}
+
 /// `struct vnode_fdinfowithpath` of `sys/proc_info.h`, which libc does not declare.
 #[repr(C)]
 struct VnodeFdInfoWithPath {
-    /// `struct proc_fileinfo`: 24 bytes, 8-aligned, this adapter does not read.
-    _file: [u64; 3],
+    file: ProcFileInfo,
     path: libc::vnode_info_path,
 }
 
@@ -60,6 +75,9 @@ pub async fn start(start: process::Start) -> Result<process::Started, Error> {
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr);
+    if let Some(what) = &start.started {
+        command.env("STEERY_STARTED", format!("{}:{what}", std::process::id()));
+    }
     // SAFETY: setsid is async-signal-safe, and the closure touches nothing else.
     unsafe {
         command.pre_exec(|| {
@@ -79,10 +97,42 @@ pub async fn start(start: process::Start) -> Result<process::Started, Error> {
     let process_start = info(pid)
         .map(|info| info.start)
         .ok_or_else(|| Error::refused(refusal::START_FAILED, "its start time is unreadable"))?;
+    let status = start.status;
     tokio::spawn(async move {
-        let _ = child.wait().await;
+        if let (Ok(ended), Some(path)) = (child.wait().await, status) {
+            write_ended(&path, ended);
+        }
     });
     Ok(process::Started { pid, process_start })
+}
+
+/// Writes how a reaped child ended to `path`, mode 0600, whole: through a file beside it
+/// renamed over it. A failure is the reader's to see as no file.
+fn write_ended(path: &Path, ended: std::process::ExitStatus) {
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    let ended = match (ended.code(), ended.signal()) {
+        (Some(code), _) => process::Ended::Code(code),
+        (None, Some(signal)) => process::Ended::Signal(signal),
+        (None, None) => return,
+    };
+    let Ok(said) = serde_json::to_vec(&ended) else {
+        return;
+    };
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".writing");
+    let beside = PathBuf::from(beside);
+    let written = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&beside)
+        .and_then(|mut file| file.write_all(&said))
+        .and_then(|()| std::fs::rename(&beside, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&beside);
+    }
 }
 
 /// A file opened for appending, made with mode 0600 if missing.
@@ -156,10 +206,12 @@ fn entry(
     Some(process::Entry {
         pid,
         ppid: info.ppid,
+        pgid: info.pgid,
         process_start: info.start,
         command: info.command,
         args,
         user,
+        stopped: info.stopped,
         cwd: cwd(pid),
     })
 }
@@ -251,9 +303,15 @@ pub fn environ(environ: process::Environ) -> Result<process::Values, Error> {
     Ok(process::Values { values })
 }
 
-/// The files a process holds open: each vnode descriptor that names an absolute path.
+/// The files a process holds open: each vnode descriptor that names an absolute path,
+/// only those open for writing where `writing`. A process forked and not exec'd since
+/// holds its parent's copies, so it answers none.
 pub fn files(files: process::Files) -> Result<process::Paths, Error> {
+    let execed = info(files.pid).is_some_and(|info| info.execed);
     same(files.pid, files.process_start)?;
+    if !execed {
+        return Ok(process::Paths { paths: Vec::new() });
+    }
     let unreadable = || {
         Error::refused(
             refusal::NOT_FOUND,
@@ -297,7 +355,7 @@ pub fn files(files: process::Files) -> Result<process::Paths, Error> {
             )
         };
         // A descriptor closed since the list is left out.
-        if read != size {
+        if read != size || (files.writing && vnode.file.fi_openflags & FWRITE == 0) {
             continue;
         }
         let path = PathBuf::from(OsString::from_vec(bytes_of(
@@ -763,10 +821,16 @@ fn escape(value: &str) -> String {
 /// What `proc_pidinfo(PROC_PIDTBSDINFO)` gives this adapter.
 struct Info {
     ppid: u32,
+    /// Its process group.
+    pgid: u32,
     /// The effective user.
     uid: u32,
     /// It exited and waits to be reaped.
     zombie: bool,
+    /// It is stopped by a signal (Ctrl-Z, SIGSTOP).
+    stopped: bool,
+    /// It has called exec since it was forked.
+    execed: bool,
     /// Milliseconds since 1970.
     start: u64,
     command: String,
@@ -792,8 +856,11 @@ fn info(pid: u32) -> Option<Info> {
     };
     Some(Info {
         ppid: bsd.pbi_ppid,
+        pgid: bsd.pbi_pgid,
         uid: bsd.pbi_uid,
         zombie: bsd.pbi_status == libc::SZOMB,
+        stopped: bsd.pbi_status == libc::SSTOP,
+        execed: bsd.pbi_flags & PROC_FLAG_EXEC != 0,
         start: bsd.pbi_start_tvsec * 1000 + bsd.pbi_start_tvusec / 1000,
         command: String::from_utf8_lossy(&bytes_of(name)).into_owned(),
     })
