@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@steery/driver-daytona",
+      "name": "@steery/adapter-daytona",
       "dependencies": {
         "@daytona/sdk": "0.223.0",
       },

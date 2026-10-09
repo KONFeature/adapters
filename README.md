@@ -1,13 +1,14 @@
-# Steery adapters and drivers
+# Steery adapters
 
-Open adapters and drivers for [Steery](https://steery.dev). `adapters/` will hold one
-adapter per agent harness. `drivers/` will hold one driver per machine provider.
+Open adapters for [Steery](https://steery.dev). An adapter connects Steery to one kind of
+machine: an operating system (`mac`, `linux`) or a sandbox provider (`daytona`,
+`opensandbox`). Drivers, one per agent harness, live in `steery-dev/drivers`.
 
-**Only Step A of the Daytona driver exists today:** one Daytona sandbox runs as one Steery
-machine.
+**Only the first step of the daytona adapter exists today:** one Daytona sandbox runs as
+one Steery machine.
 
 ```
-drivers/daytona/     a Bun CLI: up, logs, status, down
+daytona/     a Bun CLI: up, logs, status, down
 ```
 
 ## What Steery adds to a sandbox
@@ -55,14 +56,14 @@ it starts.
 ### Run it
 
 ```sh
-cd drivers/daytona
+cd daytona
 bun install
 export DAYTONA_API_KEY=…
 
-bun src/up.ts up --name goldsky --snapshot my-team-snapshot --custody file
-bun src/up.ts logs --name goldsky         # follow steery run
-bun src/up.ts status --name goldsky
-bun src/up.ts down --name goldsky         # stop it; its disk and key are kept
+bun src/up.ts up --name team --snapshot my-team-snapshot --custody file
+bun src/up.ts logs --name team         # follow steery run
+bun src/up.ts status --name team
+bun src/up.ts down --name team         # stop it; its disk and key are kept
 ```
 
 `up` creates the sandbox `steery-<name>` from `--snapshot <name>` or `--image <ref>`. With

@@ -1,5 +1,5 @@
 {
-  "name": "@steery/driver-daytona",
+  "name": "@steery/adapter-daytona",
   "version": "0.1.0",
   "description": "Run a Steery machine in a Daytona sandbox",
   "license": "MIT",
