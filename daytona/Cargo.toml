@@ -1,0 +1,19 @@
+[package]
+name = "steery-adapter-daytona"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Steery's official adapter for Daytona: it makes, starts, stops and reaches Daytona sandboxes through Daytona's REST API."
+
+[dependencies]
+steery-sdk = { path = "../../server/crates/steery-sdk" }
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["parsing"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+# Its own workspace, so it builds alone.
+[workspace]
