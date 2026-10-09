@@ -9,9 +9,9 @@
 mod channel;
 mod provider;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -52,6 +52,7 @@ async fn main() -> io::Result<()> {
         OpenSandbox {
             provider: RwLock::new(Err("initialize comes first".into())),
             channels,
+            keys: Keys::default(),
         }
     })
     .await;
@@ -65,6 +66,31 @@ async fn main() -> io::Result<()> {
 struct OpenSandbox {
     provider: RwLock<Result<Arc<Provider>, String>>,
     channels: Arc<Channels>,
+    keys: Keys,
+}
+
+/// One lock per key a `sandbox/ensure` runs for: two ensures for one key in this process
+/// run one after the other, so the second finds what the first made.
+#[derive(Default)]
+struct Keys(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl Keys {
+    fn of(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Forget `key`'s lock once no other ensure holds or waits for it.
+    fn release(&self, key: &str, lock: Arc<tokio::sync::Mutex<()>>) {
+        let mut keys = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::strong_count(&lock) == 2 {
+            keys.remove(key);
+        }
+    }
 }
 
 impl OpenSandbox {
@@ -129,7 +155,18 @@ impl Program for OpenSandbox {
     async fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         match method {
             method::SANDBOXES_LIST => result(list(&*self.provider()?, given(params)?).await?),
-            method::SANDBOX_ENSURE => result(ensure(&*self.provider()?, given(params)?).await?),
+            method::SANDBOX_ENSURE => {
+                let asked: Ensure = given(params)?;
+                let provider = self.provider()?;
+                let key = asked.key.clone();
+                let lock = self.keys.of(&key);
+                let answer = {
+                    let _held = lock.lock().await;
+                    ensure(&provider, asked).await
+                };
+                self.keys.release(&key, lock);
+                result(answer?)
+            }
             method::SANDBOX_START => result(start(&*self.provider()?, given(params)?).await?),
             method::SANDBOX_STOP | method::SANDBOX_PAUSE => {
                 result(pause(&*self.provider()?, given(params)?).await?)
@@ -230,17 +267,17 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
         (MINE.0.to_owned(), MINE.1.to_owned()),
         (KEY_LABEL.to_owned(), key.to_owned()),
     ]);
-    let found = provider
+    let listed = provider
         .listed(&mine)
         .await
-        .map_err(|fail| provider.refuse(fail, refusal::REFUSED))?
-        .into_iter()
-        .find(|found| !GONE.contains(&found.status.state.as_str()));
-    if let Some(found) = found {
-        return Ok(Named { sandbox: found.id });
+        .map_err(|fail| provider.refuse(fail, refusal::REFUSED))?;
+    if let Some(found) = oldest(listed.iter()) {
+        return Ok(Named {
+            sandbox: found.id.clone(),
+        });
     }
     let mut metadata = asked.labels;
-    metadata.extend(mine);
+    metadata.extend(mine.clone());
     // `resourceLimits` is required outside pool mode; empty, the server's own defaults apply.
     let body = match &asked.source {
         Some(Source::Image(image)) => json!({
@@ -265,6 +302,27 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
         .create(&body)
         .await
         .map_err(|fail| provider.refuse(fail, refusal::START_FAILED))?;
+    // OpenSandbox takes no name to make a sandbox by and has nothing to lock on, so an
+    // ensure for the same key in another process may have made one at the same time: the
+    // oldest of them is the key's sandbox, and a younger one made here is deleted.
+    let others = match provider.listed(&mine).await {
+        Ok(listed) => listed,
+        Err(fail) => {
+            eprintln!("{}", provider.line(fail.said()));
+            Vec::new()
+        }
+    };
+    // Each is compared as the listing reads it: the creation time the server answered a
+    // create with is not the one it lists.
+    let listed_made = others.iter().any(|found| found.id == made.id);
+    let kept = oldest(others.iter().chain((!listed_made).then_some(&made)))
+        .map_or(made.id.clone(), |found| found.id.clone());
+    if kept != made.id {
+        if let Err(fail) = provider.delete(&made.id).await {
+            eprintln!("{}", provider.line(fail.said()));
+        }
+        return Ok(Named { sandbox: kept });
+    }
     // The server gave it a TTL: keep it, so keepalive renews by the same.
     let ttl = made
         .expires_at
@@ -280,6 +338,14 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
         }
     }
     Ok(Named { sandbox: made.id })
+}
+
+/// The oldest sandbox that is not going away; of two made at once, the one whose id sorts
+/// first.
+fn oldest<'a>(found: impl Iterator<Item = &'a Found>) -> Option<&'a Found> {
+    found
+        .filter(|found| !GONE.contains(&found.status.state.as_str()))
+        .min_by_key(|found| (millis(&found.created_at).unwrap_or(i64::MAX), &found.id))
 }
 
 async fn start(provider: &Provider, asked: Named) -> Result<State, Error> {

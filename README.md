@@ -162,7 +162,12 @@ and WebSocket (rustls), with no provider SDK:
   is given the entrypoint `tail -f /dev/null`, because the API requires one; its resource
   limits are left empty, so the server's own apply. Metadata keys and values follow
   Kubernetes label rules (63 characters; letters, digits, `-`, `_`, `.`), so a key or label
-  outside them is refused by the server.
+  outside them is refused by the server. OpenSandbox takes no name to make a sandbox by and
+  has nothing to lock on, so ensures for one key run one after the other in the adapter,
+  and after making one it lists the key again: the oldest sandbox, by the creation time the
+  listing reads, is the key's, and a younger one it made is deleted. Two adapters making one
+  at once thus answer one sandbox, as long as the server lists each before the other's
+  create answers (a create still pulling its image is not listed).
 - `sandbox/start` resumes a paused sandbox and waits until it runs; `stop` and `pause`
   pause it (OpenSandbox's only stop that keeps it); `delete` deletes it. Its filesystem
   survives a pause.
