@@ -4,12 +4,21 @@ Open adapters for [Steery](https://steery.dev). An adapter connects Steery to on
 machine: an operating system (`mac`, `linux`) or a sandbox provider (`daytona`,
 `opensandbox`). Drivers, one per agent harness, live in `steery-dev/drivers`.
 
-**Only the first step of the daytona adapter exists today:** one Daytona sandbox runs as
-one Steery machine.
+Two adapters exist today: `linux`, and the first step of `daytona`, where one Daytona
+sandbox runs as one Steery machine.
 
 ```
+linux/       a Rust binary: the official Linux adapter
 daytona/     a Bun CLI: up, logs, status, down
 ```
+
+## linux
+
+`linux/` provides `processes` on Linux: it starts turns detached (in a systemd user scope
+when one is reachable), lists processes and reads their environment and open files from
+`/proc`, signals only a process whose start time still matches, and plans the systemd
+user unit that keeps the runtime running. It ships with `steery` and updates with it.
+It speaks the program protocol over standard input and output through `steery-sdk`.
 
 ## What Steery adds to a sandbox
 
