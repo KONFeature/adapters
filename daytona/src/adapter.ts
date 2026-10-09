@@ -23,8 +23,10 @@ const SSH_HOST = "ssh.app.daytona.io";
 /** How long a channel's SSH access token lives, in minutes. */
 const SSH_MINUTES = 60;
 /** Seconds the adapter waits for Daytona, inside the runtime's bounds (§9: 300 s, 60 s). */
-const MAKE_SECONDS = 280;
+const LONG_SECONDS = 280;
 const CHANGE_SECONDS = 55;
+/** Seconds for one shell command in the sandbox: a size check, a chmod, a removal. */
+const COMMAND_SECONDS = 5;
 
 let settings: Record<string, string> = {};
 let client: DaytonaClient | undefined;
@@ -64,6 +66,9 @@ const NETWORK_CODES: Record<string, true> = {
 /** The refusal a provider error is; `otherwise` where it is none of not found, auth or network. */
 function refuse(error: unknown, otherwise: Refusal): ProgramError {
   if (error instanceof ProgramError) return error;
+  // Before the connection test: Daytona's transport timeout is a connection error too, but a
+  // call that ran out of time reached Daytona and is not offline.
+  if (error instanceof daytona.DaytonaTimeoutError) return ProgramError.refused(refusal.REFUSED, `${line(error)} (timed out)`);
   let word: Refusal = otherwise;
   if (error instanceof daytona.DaytonaNotFoundError) word = refusal.NOT_FOUND;
   else if (error instanceof daytona.DaytonaAuthenticationError || error instanceof daytona.DaytonaForbiddenError)
@@ -142,8 +147,8 @@ async function ensure(params: wire.Ensure): Promise<wire.Named> {
   return provider(refusal.START_FAILED, async (c) => {
     const made =
       source && "image" in source
-        ? await c.create({ image: source.image, labels }, { timeout: MAKE_SECONDS })
-        : await c.create(source ? { snapshot: source.snapshot, labels } : { labels }, { timeout: MAKE_SECONDS });
+        ? await c.create({ image: source.image, labels }, { timeout: LONG_SECONDS })
+        : await c.create(source ? { snapshot: source.snapshot, labels } : { labels }, { timeout: LONG_SECONDS });
     return { sandbox: made.id };
   });
 }
@@ -152,7 +157,7 @@ async function start(params: wire.Named): Promise<wire.State> {
   const id = text(params, "sandbox");
   return provider(refusal.START_FAILED, async (c) => {
     const sandbox = await c.get(id);
-    await sandbox.start(MAKE_SECONDS);
+    await sandbox.start(LONG_SECONDS);
     return stateOf(sandbox, "started");
   });
 }
@@ -179,7 +184,7 @@ async function remove(params: wire.Named): Promise<wire.State> {
 async function archive(params: wire.Named): Promise<wire.State> {
   const id = text(params, "sandbox");
   return provider(refusal.REFUSED, async (c) => {
-    const deadline = Date.now() + CHANGE_SECONDS * 1000;
+    const deadline = Date.now() + LONG_SECONDS * 1000;
     const sandbox = await c.get(id);
     const was = sandbox.state;
     if (was !== daytona.SandboxState.ARCHIVED) {
@@ -191,7 +196,7 @@ async function archive(params: wire.Named): Promise<wire.State> {
       const state: string | undefined = sandbox.state;
       if (state === daytona.SandboxState.ARCHIVED) break;
       if (state === daytona.SandboxState.ERROR) throw new Error(`sandbox ${id} failed to archive: ${sandbox.errorReason ?? "error"}`);
-      if (Date.now() > deadline) throw new Error(`sandbox ${id} is still ${state ?? "unknown"}, not archived`);
+      if (Date.now() > deadline) throw new Error(`sandbox ${id} timed out after ${LONG_SECONDS} s still ${state ?? "unknown"}, not archived`);
       await sleep(2000);
       await sandbox.refreshData();
     }
@@ -215,8 +220,27 @@ async function put(params: wire.Put): Promise<Record<string, never>> {
   const content = Buffer.from(params.content, "base64");
   return provider(refusal.REFUSED, async (c) => {
     const sandbox = await c.get(id);
-    await sandbox.fs.uploadFile(content, path, CHANGE_SECONDS / 2);
-    const chmod = await sandbox.process.executeCommand(`chmod ${params.mode.toString(8)} ${quote(path)}`, undefined, undefined, 20);
+    const run = async (command: string) => sandbox.process.executeCommand(command, undefined, undefined, COMMAND_SECONDS);
+    let timedOut = false;
+    try {
+      await sandbox.fs.uploadFile(content, path, LONG_SECONDS);
+    } catch (error) {
+      if (!(error instanceof daytona.DaytonaTimeoutError)) throw error;
+      timedOut = true;
+    }
+    // An upload can answer before the file is whole, or time out half-written: the size on
+    // the sandbox is the proof, and a partial file is removed rather than left to be run.
+    const stat = await run(`stat -c %s ${quote(path)}`);
+    const written = stat.exitCode === 0 ? Number(stat.result.trim()) : 0;
+    if (timedOut || written !== content.length) {
+      await run(`rm -f ${quote(path)}`);
+      const why = timedOut ? `the upload timed out after ${LONG_SECONDS} s` : "the upload ended short";
+      throw ProgramError.refused(
+        refusal.REFUSED,
+        `Daytona: ${why}: ${path} had ${written} of ${content.length} bytes written; removed it (fetch a large file from inside the sandbox)`,
+      );
+    }
+    const chmod = await run(`chmod ${params.mode.toString(8)} ${quote(path)}`);
     if (chmod.exitCode !== 0) throw new Error(`chmod ${path} exited ${chmod.exitCode}: ${chmod.result}`);
     return {};
   });
