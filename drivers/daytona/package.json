@@ -1,0 +1,21 @@
+{
+  "name": "@steery/driver-daytona",
+  "version": "0.1.0",
+  "description": "Run a Steery machine in a Daytona sandbox",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "steery-daytona": "src/up.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@daytona/sdk": "0.223.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "5.9.3"
+  }
+}
