@@ -12,7 +12,7 @@ runs one Daytona sandbox as one Steery machine.
 mac/         a Rust binary: the official macOS adapter
 linux/       a Rust binary: the official Linux adapter
 daytona/     a Node program: the Daytona adapter; and a Bun CLI: up, logs, status, down
-opensandbox/ a Node program: the OpenSandbox adapter
+opensandbox/ a Rust binary: the OpenSandbox adapter
 ```
 
 ## Building
@@ -115,9 +115,12 @@ it. `up` (Step A, below) remains, for running the whole runtime inside one sandb
 
 ## opensandbox
 
-`opensandbox/` provides `sandboxes` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox),
-through its lifecycle API and the execd daemon in each sandbox, with `fetch` and Node's
-`WebSocket` and no provider SDK:
+`opensandbox/` provides `sandboxes` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
+(`initialize` answers `machine: {provides: "sandboxes", keeps: "filesystem", idle: "ttl",
+optional: ["pause", "keepalive"], channel: "stream", os: "linux"}`). It is a Rust binary,
+`steery-adapter-opensandbox`, speaking the program protocol through `steery-sdk`, and talks
+to OpenSandbox's published lifecycle API and to the execd daemon in each sandbox over HTTP
+and WebSocket (rustls), with no provider SDK:
 
 - `sandboxes/list`: the sandboxes whose metadata holds `steery=sandbox` and every label asked.
 - `sandbox/ensure`: finds the sandbox whose metadata holds `steery-key=<key>`, or makes one
@@ -130,15 +133,19 @@ through its lifecycle API and the execd daemon in each sandbox, with `fetch` and
 - `sandbox/start` resumes a paused sandbox and waits until it runs; `stop` and `pause`
   pause it (OpenSandbox's only stop that keeps it); `delete` deletes it. Its filesystem
   survives a pause.
-- `sandbox/keepalive` renews the expiration by the TTL the server gave it when it was made,
-  or by an hour; a sandbox with no expiration needs none. The adapter sets no timeout of its
-  own, so the server's default is the sandbox's idle timer.
-- `sandbox/put` uploads the file through execd (`/files/upload`) with its mode.
+- `sandbox/keepalive` renews the expiration by the TTL the server gave it when it was made
+  (kept in its metadata as `steery-ttl`), or by an hour; a sandbox with no expiration needs
+  none. The adapter sets no timeout of its own, so the server's default is the sandbox's
+  idle timer; on the Docker runtime that default is none, and a sandbox lives until it is
+  deleted.
+- `sandbox/put` uploads the file through execd (`/files/upload`) with its mode, then reads
+  its size back (`/files/info`); a file that is not whole is removed before it refuses.
 - `sandbox/channel` is a `stream` channel: it opens a pipe-mode PTY session in execd running
   the command (`POST /pty`) and joins its WebSocket (`/pty/{id}/ws?pty=0`), reached through
   the sandbox's endpoint for port 44772 and the headers that endpoint names.
   `stream/write` sends standard-input frames; standard output comes back as `stream/data`,
-  standard error goes to the adapter's log, and `stream/closed` carries the exit code.
+  standard error goes to the adapter's log, and `stream/closed` carries the exit code (none
+  for a command a signal ended).
   execd has no frame that closes only standard input, so `stream/close` sends the command
   SIGHUP, ends the session after two seconds if it still runs, and closes the socket.
 
@@ -152,9 +159,16 @@ Its settings, given once on the card the runtime raises when it is added:
 | `OPENSANDBOX_URL` | required | your OpenSandbox server, as its SDKs take it: `http://localhost:8080` |
 | `OPENSANDBOX_API_KEY` | secret, optional | the server's `server.api_key`, where it has one |
 
-It reads them from `initialize` only. Build it with `npm install && npm run build` in
-`opensandbox/`; the program is `dist/adapter.js` (`steery-adapter-opensandbox`), and
-`steery adapter test node opensandbox/dist/adapter.js` checks it.
+It reads them from `initialize` only, never from its environment. Build and check it:
+
+```sh
+cd opensandbox && cargo build && cargo clippy && cargo test
+steery adapter test target/debug/steery-adapter-opensandbox \
+  --setting OPENSANDBOX_URL=http://localhost:8080 --setting OPENSANDBOX_API_KEY=…
+```
+
+The check lists sandboxes on the server it is given; a local server is the
+`opensandbox/server` image with the Docker runtime (its `server/docker-compose.example.yaml`).
 
 ## What Steery adds to a sandbox
 

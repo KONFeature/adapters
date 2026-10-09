@@ -220,7 +220,9 @@ impl Channels {
                 };
                 match frame.kind.as_str() {
                     "exit" => {
-                        *open.exit.lock().unwrap_or_else(|e| e.into_inner()) = frame.exit_code;
+                        // execd says -1 for a command a signal ended: it has no exit code.
+                        *open.exit.lock().unwrap_or_else(|e| e.into_inner()) =
+                            frame.exit_code.filter(|code| *code >= 0);
                     }
                     "error" => eprintln!("[{}] {}", open.stream, frame.said()),
                     _ => {}
