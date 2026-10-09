@@ -1,25 +1,25 @@
 # Steery adapters
 
 Open adapters for [Steery](https://steery.dev). An adapter connects Steery to one kind of
-machine: an operating system (`mac`, `linux`) or a sandbox provider (`daytona`,
+machine: an operating system (`macos`, `linux`) or a sandbox provider (`daytona`,
 `opensandbox`). Drivers, one per agent harness, live in `steery-dev/drivers`.
 
-Four adapters exist today: `mac`, `linux`, `daytona`, which provides Daytona sandboxes,
-and `opensandbox`, which provides OpenSandbox sandboxes; beside `daytona`, Step A's `up`
-runs one Daytona sandbox as one Steery machine.
+Four adapters exist today: `macos`, `linux`, `daytona`, which provides Daytona sandboxes,
+and `opensandbox`, which provides OpenSandbox sandboxes. An operating-system adapter's id
+is the name Rust gives that system (`std::env::consts::OS`): the runtime runs the one
+named for the system it runs on.
 
 ```
-mac/         a Rust binary: the official macOS adapter
+macos/       a Rust binary: the official macOS adapter
 linux/       a Rust binary: the official Linux adapter
-daytona/     a Node program: the Daytona adapter; and a Bun CLI: up, logs, status, down
-opensandbox/ a Rust binary: the OpenSandbox adapter
+daytona/     a Rust binary: the official Daytona adapter
+opensandbox/ a Rust binary: the official OpenSandbox adapter
 ```
 
 ## Building
 
 The SDKs and the protocol live in Steery's own repository until they are published. Check
-it out beside this one, as `server`; the Rust adapters use `../server/crates/steery-sdk`
-and the Node ones `../server/sdk/typescript` (build that first with `npm run build`).
+it out beside this one, as `server`; every adapter uses `../server/crates/steery-sdk`.
 
 ```sh
 git clone https://github.com/steery-dev/server
@@ -61,9 +61,9 @@ output through `steery-sdk`.
   the slice's file, never stopping the slice or a turn. Each refuses `refused` with
   systemd's line.
 
-## mac
+## macos
 
-`mac/` provides `processes` on macOS (`initialize` answers
+`macos/` provides `processes` on macOS (`initialize` answers
 `machine: {provides: "processes", os: "macos", service: "launchd"}`). It ships with
 `steery` and updates with it. Built for another system it answers `initialize` and
 refuses every method.
@@ -91,14 +91,42 @@ refuses every method.
 
 ## daytona
 
-`daytona/` provides `sandboxes` on [Daytona](https://daytona.io): `sandboxes/list`,
-`sandbox/ensure` (finds the sandbox labelled `steery-key=<key>`, or makes one labelled
-`steery=sandbox` from the snapshot or image the runtime names, or Daytona's default),
-`sandbox/start`, `stop`, `delete`, `archive`, `keepalive` (refreshes its last activity),
-`put` (uploads a file, then sets its mode) and `channel`: an `ssh -T` to Daytona's SSH
-gateway with a 60-minute access token, running the runtime's command in the sandbox. It
-passes no image, environment, secret or network setting of its own, and leaves Daytona's
-auto-stop as the sandbox's idle timer. Its filesystem survives a stop.
+`daytona/` provides `sandboxes` on [Daytona](https://daytona.io) (`initialize` answers
+`machine: {provides: "sandboxes", keeps: "filesystem", idle: "activity", optional:
+["archive", "keepalive"], channel: "argv", os: "linux"}`). It calls Daytona's published
+REST API directly, over HTTPS (rustls): the control plane
+([`openapi.json`](https://www.daytona.io/docs/openapi.json)) and each sandbox's toolbox
+([`toolbox-openapi.json`](https://www.daytona.io/docs/toolbox-openapi.json)), through the
+toolbox proxy Daytona names for it. It passes no image, environment, secret or network
+setting of its own, and leaves Daytona's auto-stop as the sandbox's idle timer.
+
+- `sandboxes/list`: the sandboxes labelled `steery=sandbox` and every label asked, page by
+  page. Daytona's listing lags a change by a second or more.
+- `sandbox/ensure`: the sandbox named `steery-<first 128 bits of the key's SHA-256, hex>`,
+  or one made under that name, labelled `steery=sandbox`, `steery-key=<key>` and the
+  labels asked, from the snapshot or image (built `FROM` it) the runtime names, or
+  Daytona's default snapshot, and waited for until it runs. Daytona keeps names unique and
+  reads them back at once, so an ensure sent twice, even at once, makes one sandbox. A
+  sandbox of that name without those labels is refused; one being deleted is waited out.
+- `sandbox/start`, `stop`, `delete` and `archive` ask Daytona and wait until the sandbox is
+  `started`, `stopped`, `destroyed` or `archived`, reading it again every second (every
+  two while archiving); `error` or `build_failed` fails. Archive stops a started sandbox
+  first, since Daytona archives only a stopped one. Its filesystem survives a stop and an
+  archive.
+- `sandbox/keepalive` refreshes the sandbox's last activity, which auto-stop counts from.
+- `sandbox/put` uploads the file (`/files/upload-v2`), reads its size back
+  (`/files/info`) and sets its mode (`/files/permissions`). A file that timed out or came
+  out short is deleted and the put refused; a large file is better fetched from inside.
+- `sandbox/channel` is an `argv` channel: `ssh -T` to Daytona's SSH gateway
+  (`ssh.app.daytona.io`, or the host and port Daytona's answer names) with a 60-minute
+  access token, running the runtime's command, quoted for the sandbox's shell.
+
+It waits for Daytona inside the runtime's bounds: 280 s for `ensure`, `start`, `archive`
+and `put` (bound 300 s), 55 s for the rest (bound 60 s), and 5 s for each file call after
+an upload. Errors read as `not-found` (HTTP 404), `untrusted` (401, 403), `offline`
+(Daytona not reached), `start-failed` (a sandbox that could not be made or started), or
+`refused`, which is also every call that ran out of time; each line is Daytona's own
+message, without the API key.
 
 Its settings, given once on the card the runtime raises when it is added:
 
@@ -108,10 +136,15 @@ Its settings, given once on the card the runtime raises when it is added:
 | `DAYTONA_API_URL` | optional | your Daytona API URL, for a self-hosted Daytona; absent: `https://app.daytona.io/api` |
 | `DAYTONA_TARGET` | optional | the region sandboxes are made in; absent: your organization's default |
 
-It reads them from `initialize` only, never from its environment or a `.env` file. Build it
-with `npm run build` in `daytona/`; the program is `dist/adapter.js`
-(`steery-adapter-daytona`), and `steery adapter test node daytona/dist/adapter.js` checks
-it. `up` (Step A, below) remains, for running the whole runtime inside one sandbox.
+It reads them from `initialize` only, never from its environment or a file. Build and
+check it:
+
+```sh
+cd daytona && cargo build && cargo clippy && cargo test
+steery adapter test target/debug/steery-adapter-daytona --setting DAYTONA_API_KEY=…
+```
+
+With the key, the check also lists your sandboxes (`sandboxes/list`); it makes none.
 
 ## opensandbox
 
@@ -172,17 +205,16 @@ The check lists sandboxes on the server it is given; a local server is the
 
 ## What Steery adds to a sandbox
 
-- The `steery` binary.
-- `steery setup <harness>`, which writes the harness's MCP entry, skill and hooks, as on a
-  laptop.
-- `steery run`, the runtime.
+A sandbox machine (`steery machine add daytona`) adds to each sandbox it uses:
+
+- the `steery` binary and its official programs, which `steery sandbox serve` runs inside;
+- the harness's MCP entry, skill and hooks, as on a laptop.
 
 It adds nothing else. The sandbox is yours: your snapshot, your Daytona settings, your
 harness, set up the way you already set them up.
 
-## The one line for your image
-
-In a Dockerfile:
+Where `steery` is missing in a sandbox, Steery installs it over the channel the first
+time. To have it there already, add the one line to your image. In a Dockerfile:
 
 ```dockerfile
 RUN curl -fsSL https://steery.dev/install.sh | sh -s -- --install-only --to /usr/local/bin
@@ -193,53 +225,6 @@ In Daytona's declarative builder:
 ```ts
 .runCommands('curl -fsSL https://steery.dev/install.sh | sh -s -- --install-only --to /usr/local/bin')
 ```
-
-Without it, `up` installs the binary into `$HOME/.local/bin` in the sandbox the first time
-it starts.
-
-## Step A: a Daytona sandbox as a Steery machine
-
-### What you need
-
-- **A Daytona API key** in `DAYTONA_API_KEY` (create one at
-  <https://app.daytona.io/dashboard/keys>).
-- **A sandbox that can reach <https://steery.dev>.** The runtime inside talks to Steery's
-  server.
-- **The harness installed in your snapshot**, the way you install your other tools. `up`
-  stops and prints the harness's own installer if it is missing.
-- **You, at your terminal and with your phone.** Setup's sign-in code is approved on the
-  phone, and you compare each signer's fingerprint with the one the phone shows before you
-  trust it.
-- **[Bun](https://bun.sh)** on your computer.
-
-### Run it
-
-```sh
-cd daytona
-bun install
-export DAYTONA_API_KEY=…
-
-bun src/up.ts up --name team --snapshot my-team-snapshot --custody file
-bun src/up.ts logs --name team         # follow steery run
-bun src/up.ts status --name team
-bun src/up.ts down --name team         # stop it; its disk and key are kept
-```
-
-`up` creates the sandbox `steery-<name>` from `--snapshot <name>` or `--image <ref>`. With
-neither, Daytona uses its default snapshot. If the sandbox exists, `up` finds it by its
-labels (`steery=machine`, `name=<name>`) and starts it. Auto-stop is off, because the
-runtime lives in the sandbox and the sandbox is the machine.
-
-Then `up` installs `steery` if it is missing, and checks that the harness is installed
-(`--harness omp`, `claude-code` or `codex`; `omp` by default). It runs
-`steery setup <harness> --name daytona-<name> --no-service` in a terminal inside the
-sandbox, joined to yours. Nothing is pinned for you; `--trust <fingerprint>` names a signer
-you already compared. Last, it starts `steery run` as a long-running Daytona session
-command. The machine shows in Steery as `daytona-<name>`.
-
-A sandbox has no TPM, so the machine's reader key can only be kept in a file there.
-Anything that can read that file can read every answer sent to this machine. `--custody
-file` is your consent to that; setup uses a file only when you say so.
 
 ## License
 

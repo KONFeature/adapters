@@ -1,4 +1,4 @@
-//! Steery's official `mac` adapter. It provides `processes`: it starts, finds, inspects
+//! Steery's official `macos` adapter. It provides `processes`: it starts, finds, inspects
 //! and signals processes on the Mac it runs on, and keeps the runtime running there as a
 //! launchd agent. It reads processes through libproc and `sysctl`.
 //!
@@ -38,7 +38,7 @@ impl Program for Mac {
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
-                id: "mac".into(),
+                id: "macos".into(),
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "macOS".into(),
@@ -85,7 +85,7 @@ impl Program for Mac {
     async fn call(&self, _method: &str, _params: Value) -> Result<Value, Error> {
         Err(Error::refused(
             steery_sdk::refusal::REFUSED,
-            "the mac adapter runs on macOS only",
+            "the macos adapter runs on macOS only",
         ))
     }
 }
