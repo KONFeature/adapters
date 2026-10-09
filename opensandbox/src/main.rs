@@ -118,7 +118,7 @@ impl Program for OpenSandbox {
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
-                id: "opensandbox".into(),
+                id: "opensandbox".parse().map_err(Error::invalid)?,
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "OpenSandbox".into(),

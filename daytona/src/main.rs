@@ -77,7 +77,7 @@ impl Program for Adapter {
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
-                id: "daytona".into(),
+                id: "daytona".parse().map_err(Error::invalid)?,
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "Daytona".into(),

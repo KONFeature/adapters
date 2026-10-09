@@ -51,7 +51,7 @@ impl Program for Linux {
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
-                id: "linux".into(),
+                id: "linux".parse().map_err(Error::invalid)?,
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "Linux".into(),

@@ -38,7 +38,7 @@ impl Program for Mac {
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
-                id: "macos".into(),
+                id: "macos".parse().map_err(Error::invalid)?,
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "macOS".into(),
