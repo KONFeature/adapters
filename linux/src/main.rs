@@ -393,14 +393,20 @@ impl Linux {
                 mode: 0o644,
             }],
             commands: vec![
-                vec!["systemctl".into(), "--user".into(), "daemon-reload".into()],
-                vec![
-                    "systemctl".into(),
-                    "--user".into(),
-                    "enable".into(),
-                    "--now".into(),
-                    format!("{label}.service"),
-                ],
+                process::PlanCommand {
+                    argv: vec!["systemctl".into(), "--user".into(), "daemon-reload".into()],
+                    may_fail: false,
+                },
+                process::PlanCommand {
+                    argv: vec![
+                        "systemctl".into(),
+                        "--user".into(),
+                        "enable".into(),
+                        "--now".into(),
+                        format!("{label}.service"),
+                    ],
+                    may_fail: false,
+                },
             ],
         })
     }

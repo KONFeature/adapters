@@ -372,18 +372,24 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
         }],
         commands: vec![
             // Unloads the job an earlier plan loaded, so the new plist is read. It fails
-            // when no such job is loaded, as on the first install.
-            vec![
-                "launchctl".into(),
-                "bootout".into(),
-                format!("{domain}/{label}"),
-            ],
-            vec![
-                "launchctl".into(),
-                "bootstrap".into(),
-                domain,
-                path.to_string_lossy().into_owned(),
-            ],
+            // when no such job is loaded, as on the first install, and may.
+            process::PlanCommand {
+                argv: vec![
+                    "launchctl".into(),
+                    "bootout".into(),
+                    format!("{domain}/{label}"),
+                ],
+                may_fail: true,
+            },
+            process::PlanCommand {
+                argv: vec![
+                    "launchctl".into(),
+                    "bootstrap".into(),
+                    domain,
+                    path.to_string_lossy().into_owned(),
+                ],
+                may_fail: false,
+            },
         ],
     })
 }
