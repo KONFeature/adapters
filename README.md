@@ -4,13 +4,13 @@ Open adapters for [Steery](https://steery.dev). An adapter connects Steery to on
 machine: an operating system (`mac`, `linux`) or a sandbox provider (`daytona`,
 `opensandbox`). Drivers, one per agent harness, live in `steery-dev/drivers`.
 
-Three adapters exist today: `mac`, `linux`, and the first step of `daytona`, where one
-Daytona sandbox runs as one Steery machine.
+Three adapters exist today: `mac`, `linux`, and `daytona`, which provides Daytona
+sandboxes; beside it, Step A's `up` runs one Daytona sandbox as one Steery machine.
 
 ```
 mac/         a Rust binary: the official macOS adapter
 linux/       a Rust binary: the official Linux adapter
-daytona/     a Bun CLI: up, logs, status, down
+daytona/     a Node program: the Daytona adapter; and a Bun CLI: up, logs, status, down
 ```
 
 ## linux
@@ -32,6 +32,30 @@ loaded with `launchctl bootstrap gui/<uid>`. launchd has no user scopes, so a st
 `scope` is ignored. macOS lets a user read only its own processes' details, so another
 user's processes are left out unless it runs as root. It ships with `steery` and updates
 with it. Built for another system it answers `initialize` and refuses every method.
+
+## daytona
+
+`daytona/` provides `sandboxes` on [Daytona](https://daytona.io): `sandboxes/list`,
+`sandbox/ensure` (finds the sandbox labelled `steery-key=<key>`, or makes one labelled
+`steery=sandbox` from the snapshot or image the runtime names, or Daytona's default),
+`sandbox/start`, `stop`, `delete`, `archive`, `keepalive` (refreshes its last activity),
+`put` (uploads a file, then sets its mode) and `channel`: an `ssh -T` to Daytona's SSH
+gateway with a 60-minute access token, running the runtime's command in the sandbox. It
+passes no image, environment, secret or network setting of its own, and leaves Daytona's
+auto-stop as the sandbox's idle timer. Its filesystem survives a stop.
+
+Its settings, given once on the card the runtime raises when it is added:
+
+| Setting | | |
+|---|---|---|
+| `DAYTONA_API_KEY` | secret, required | an API key from <https://app.daytona.io/dashboard/keys> |
+| `DAYTONA_API_URL` | optional | your Daytona API URL, for a self-hosted Daytona; absent: `https://app.daytona.io/api` |
+| `DAYTONA_TARGET` | optional | the region sandboxes are made in; absent: your organization's default |
+
+It reads them from `initialize` only, never from its environment or a `.env` file. Build it
+with `npm run build` in `daytona/`; the program is `dist/adapter.js`
+(`steery-adapter-daytona`), and `steery adapter test node daytona/dist/adapter.js` checks
+it. `up` (Step A, below) remains, for running the whole runtime inside one sandbox.
 
 ## What Steery adds to a sandbox
 

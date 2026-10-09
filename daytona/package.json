@@ -1,21 +1,28 @@
 {
   "name": "@steery/adapter-daytona",
   "version": "0.1.0",
-  "description": "Run a Steery machine in a Daytona sandbox",
+  "description": "Steery's adapter for Daytona sandboxes, and a CLI that runs a Steery machine in one",
   "license": "MIT",
   "private": true,
   "type": "module",
   "bin": {
+    "steery-adapter-daytona": "dist/adapter.js",
     "steery-daytona": "src/up.ts"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "build": "tsc -p tsconfig.adapter.json",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.adapter.json --noEmit"
   },
   "dependencies": {
-    "@daytona/sdk": "0.223.0"
+    "@daytona/sdk": "0.223.0",
+    "@steery/sdk": "file:../../steery-sdk-20261009/sdk/typescript"
   },
   "devDependencies": {
     "@types/bun": "1.4.2",
+    "@types/node": "22.20.5",
     "typescript": "5.9.3"
   }
 }
