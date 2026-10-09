@@ -57,7 +57,7 @@ impl Program for Mac {
     async fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         use steery_sdk::{method, params as given, result};
         match method {
-            method::PROCESS_START => result(macos::start(given(params)?).await?),
+            method::PROCESS_START => result(macos::start(given(params)?)?),
             method::PROCESS_LIST => result(macos::list(given(params)?)),
             method::PROCESS_ENVIRON => result(macos::environ(given(params)?)?),
             method::PROCESS_FILES => result(macos::files(given(params)?)?),

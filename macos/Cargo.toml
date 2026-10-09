@@ -7,6 +7,7 @@ description = "Steery's official adapter for macOS: it starts, finds and signals
 
 [dependencies]
 steery-sdk = { path = "../../server/crates/steery-sdk" }
+steery-adapter-common = { path = "../common" }
 libc = "0.2"
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "process", "time"] }

@@ -4,16 +4,15 @@
 //! `systemctl --user`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
+use steery_adapter_common::user_name;
 use steery_sdk::wire::{self, process};
 use steery_sdk::{Error, PROTOCOL, Program, method, refusal};
 use tokio::time::Instant;
@@ -69,7 +68,7 @@ impl Program for Linux {
     async fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         use steery_sdk::{params as given, result};
         match method {
-            method::PROCESS_START => result(start(given(params)?).await?),
+            method::PROCESS_START => result(start(given(params)?)?),
             method::PROCESS_LIST => result(list(given(params)?)),
             method::PROCESS_ENVIRON => result(environ(given(params)?)?),
             method::PROCESS_FILES => result(files(given(params)?)?),
@@ -85,105 +84,18 @@ impl Program for Linux {
     }
 }
 
-/// Starts `argv` detached, in a session and process group of its own, with exactly the
-/// environment `env`, so it outlives this adapter and the runtime. With a `scope` naming
-/// the service the runtime runs as under systemd, it runs in a transient scope in that
+/// Starts `argv` detached (`steery_adapter_common::start`). With a `scope` naming the
+/// service the runtime runs as under systemd, it runs in a transient scope in that
 /// service's slice, sharing its CPU quota and never its unit; `systemd-run --scope` execs
 /// the command in place, so the pid is the command's own. Anywhere else it runs as it is.
-async fn start(start: process::Start) -> Result<process::Started, Error> {
-    if start.argv.is_empty() {
-        return Err(Error::invalid("argv is empty"));
-    }
-    let argv = match start.scope.as_deref() {
-        Some(scope) => {
-            let label = unit_label(scope)?;
-            if supervised(label) {
-                scoped(label, start.argv)
-            } else {
-                start.argv
-            }
+fn start(mut start: process::Start) -> Result<process::Started, Error> {
+    if let Some(scope) = start.scope.as_deref() {
+        let label = unit_label(scope)?;
+        if supervised(label) {
+            start.argv = scoped(label, std::mem::take(&mut start.argv));
         }
-        None => start.argv,
-    };
-    let failed = |what: &str, path: &Path, e: io::Error| {
-        Error::refused(
-            refusal::START_FAILED,
-            format!("{what} {}: {e}", path.display()),
-        )
-    };
-    let stdin = match &start.stdin {
-        Some(path) => Stdio::from(File::open(path).map_err(|e| failed("stdin", path, e))?),
-        None => Stdio::null(),
-    };
-    let stdout = append(&start.stdout).map_err(|e| failed("stdout", &start.stdout, e))?;
-    let stderr = append(&start.stderr).map_err(|e| failed("stderr", &start.stderr, e))?;
-    let mut command = tokio::process::Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .env_clear()
-        .envs(&start.env)
-        .current_dir(&start.cwd)
-        .stdin(stdin)
-        .stdout(stdout)
-        .stderr(stderr);
-    if let Some(what) = &start.started {
-        command.env("STEERY_STARTED", format!("{}:{what}", std::process::id()));
     }
-    // SAFETY: setsid is async-signal-safe, and the closure touches nothing else.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| Error::refused(refusal::START_FAILED, format!("{}: {e}", argv[0])))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| Error::refused(refusal::START_FAILED, "it exited at once"))?;
-    // Read before the reaper runs: until it is reaped, an exited child keeps its entry.
-    let process_start = stat(pid)
-        .map(|stat| stat.start)
-        .ok_or_else(|| Error::refused(refusal::START_FAILED, "its start time is unreadable"))?;
-    let status = start.status;
-    tokio::spawn(async move {
-        if let (Ok(ended), Some(path)) = (child.wait().await, status) {
-            write_ended(&path, ended);
-        }
-    });
-    Ok(process::Started { pid, process_start })
-}
-
-/// Writes how a reaped child ended to `path`, mode 0600, whole: through a file beside it
-/// renamed over it. A failure is the reader's to see as no file.
-fn write_ended(path: &Path, ended: ExitStatus) {
-    use std::io::Write;
-    use std::os::unix::process::ExitStatusExt;
-    let ended = match (ended.code(), ended.signal()) {
-        (Some(code), _) => process::Ended::Code(code),
-        (None, Some(signal)) => process::Ended::Signal(signal),
-        (None, None) => return,
-    };
-    let Ok(said) = serde_json::to_vec(&ended) else {
-        return;
-    };
-    let mut beside = path.as_os_str().to_owned();
-    beside.push(".writing");
-    let beside = PathBuf::from(beside);
-    let written = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&beside)
-        .and_then(|mut file| file.write_all(&said))
-        .and_then(|()| fs::rename(&beside, path));
-    if written.is_err() {
-        let _ = fs::remove_file(&beside);
-    }
+    steery_adapter_common::start(start, |pid| stat(pid).map(|stat| stat.start))
 }
 
 /// `argv` in a transient scope of its own in `label`'s slice.
@@ -210,15 +122,6 @@ fn supervised(label: &str) -> bool {
     runtime > 1
         && fs::read_to_string(format!("/proc/{runtime}/cgroup"))
             .is_ok_and(|groups| groups.lines().any(|line| line.ends_with(&unit)))
-}
-
-/// A file opened for appending, made with mode 0600 if missing.
-fn append(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
 }
 
 /// Every pid `/proc` lists.
@@ -287,37 +190,6 @@ fn entry(pid: u32, users: &mut BTreeMap<u32, String>) -> Option<process::Entry> 
 fn command(pid: u32) -> Option<String> {
     let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     Some(comm.trim_end_matches('\n').to_owned())
-}
-
-/// The user's name from the password database, else the number.
-fn user_name(uid: u32) -> String {
-    let mut buffer = vec![0u8; 1024];
-    loop {
-        // SAFETY: passwd is plain data; getpwuid_r fills it or leaves `found` null.
-        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut found = std::ptr::null_mut();
-        // SAFETY: every pointer is valid for the length given.
-        let code = unsafe {
-            libc::getpwuid_r(
-                uid,
-                &mut entry,
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut found,
-            )
-        };
-        if code == libc::ERANGE && buffer.len() < 1 << 20 {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        if code != 0 || found.is_null() || entry.pw_name.is_null() {
-            return uid.to_string();
-        }
-        // SAFETY: pw_name points into `buffer`, NUL-terminated.
-        return unsafe { CStr::from_ptr(entry.pw_name) }
-            .to_string_lossy()
-            .into_owned();
-    }
 }
 
 /// The asked variables of a process, refused `not-found` unless the pid still has the

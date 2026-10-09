@@ -21,6 +21,11 @@ opensandbox/ steery-adapter-opensandbox: OpenSandbox sandboxes
 ```
 
 Each crate is a Cargo workspace of its own, with its own `Cargo.lock`, so it builds alone.
+What `linux` and `macos` share, where POSIX behaves the same on both, is the
+[`common`](common/) crate, `steery-adapter-common`, each naming it by path (`../common`):
+`process/start`'s detached start with its `STEERY_STARTED` and status file, the output
+files it appends to, and a user's name. What each system keeps — `/proc` or libproc,
+systemd or launchd — stays in its own adapter.
 
 ## Building
 
@@ -195,10 +200,14 @@ setting of its own, and leaves Daytona's auto-stop as the sandbox's idle timer.
 
 It waits for Daytona inside the runtime's bounds: 280 s for `ensure`, `start`, `archive`
 and `put` (bound 300 s), 55 s for the rest (bound 60 s), and 5 s for each file call after
-an upload. Errors read as `not-found` (HTTP 404), `untrusted` (401, 403), `offline`
-(Daytona not reached), `start-failed` (a sandbox that could not be made or started), or
-`refused`, which is also every call that ran out of time; each line is Daytona's own
-message, without the API key.
+an upload. Errors read as `not-found` (HTTP 404); `offline` where Daytona is down — not
+reached, a gateway answering for it (HTTP 502, 503, 504), or a request with no answer in
+its time — a retry the server bounds; `refused` for a refused API key (HTTP 401, 403),
+whose line names the setting to give again (`Daytona refused the API key (HTTP 401: …):
+give DAYTONA_API_KEY again`), since a bad key does not heal by waiting; `start-failed` (a
+sandbox that could not be made or started); or `refused`, which is also a sandbox that
+did not reach the state asked for in time, and a put whose upload got no answer by its
+bound. Each line is Daytona's own message, without the API key.
 
 Its settings, given once on the card the runtime raises when it is added:
 
@@ -259,8 +268,10 @@ and WebSocket (rustls), with no provider SDK:
   execd has no frame that closes only standard input, so `stream/close` sends the command
   SIGHUP, ends the session after two seconds if it still runs, and closes the socket.
 
-Errors read as `not-found` (HTTP 404), `untrusted` (401, 403), `offline` (the server cannot
-be reached), `start-failed` (a sandbox that could not be made or resumed) or `refused`.
+Errors read as `not-found` (HTTP 404); `offline` where OpenSandbox is down — not reached,
+a gateway answering for it (HTTP 502, 503, 504), or no answer in time; `refused` for a
+refused API key (HTTP 401, 403), whose line names `OPENSANDBOX_API_KEY` to give (again);
+`start-failed` (a sandbox that could not be made or resumed); or `refused`.
 
 Its settings, given once on the card the runtime raises when it is added:
 
