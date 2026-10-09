@@ -3,12 +3,10 @@
 //! another user is left out of a list and refused like a gone one; root reads them all.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CStr, OsString};
-use std::fs::{File, OpenOptions};
+use std::ffi::OsString;
 use std::io;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::ptr;
@@ -16,6 +14,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use libc::c_int;
+use steery_adapter_common::user_name;
 use steery_sdk::wire::{self, process};
 use steery_sdk::{Error, refusal};
 use tokio::time::Instant;
@@ -46,102 +45,11 @@ struct VnodeFdInfoWithPath {
     path: libc::vnode_info_path,
 }
 
-/// Starts `argv` detached, in a session and process group of its own, with exactly the
-/// environment `env`, so it outlives this adapter and the runtime: launchd stops only the
-/// stopped job's own process group. `scope` is ignored: launchd has no share of the CPU
-/// to run it in.
-pub async fn start(start: process::Start) -> Result<process::Started, Error> {
-    let Some((program, args)) = start.argv.split_first() else {
-        return Err(Error::invalid("argv is empty"));
-    };
-    let failed = |what: &str, path: &Path, e: io::Error| {
-        Error::refused(
-            refusal::START_FAILED,
-            format!("{what} {}: {e}", path.display()),
-        )
-    };
-    let stdin = match &start.stdin {
-        Some(path) => Stdio::from(File::open(path).map_err(|e| failed("stdin", path, e))?),
-        None => Stdio::null(),
-    };
-    let stdout = append(&start.stdout).map_err(|e| failed("stdout", &start.stdout, e))?;
-    let stderr = append(&start.stderr).map_err(|e| failed("stderr", &start.stderr, e))?;
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .env_clear()
-        .envs(&start.env)
-        .current_dir(&start.cwd)
-        .stdin(stdin)
-        .stdout(stdout)
-        .stderr(stderr);
-    if let Some(what) = &start.started {
-        command.env("STEERY_STARTED", format!("{}:{what}", std::process::id()));
-    }
-    // SAFETY: setsid is async-signal-safe, and the closure touches nothing else.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| Error::refused(refusal::START_FAILED, format!("{program}: {e}")))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| Error::refused(refusal::START_FAILED, "it exited at once"))?;
-    // Read before the reaper runs: until it is reaped, an exited child keeps its entry.
-    let process_start = info(pid)
-        .map(|info| info.start)
-        .ok_or_else(|| Error::refused(refusal::START_FAILED, "its start time is unreadable"))?;
-    let status = start.status;
-    tokio::spawn(async move {
-        if let (Ok(ended), Some(path)) = (child.wait().await, status) {
-            write_ended(&path, ended);
-        }
-    });
-    Ok(process::Started { pid, process_start })
-}
-
-/// Writes how a reaped child ended to `path`, mode 0600, whole: through a file beside it
-/// renamed over it. A failure is the reader's to see as no file.
-fn write_ended(path: &Path, ended: std::process::ExitStatus) {
-    use std::io::Write;
-    use std::os::unix::process::ExitStatusExt;
-    let ended = match (ended.code(), ended.signal()) {
-        (Some(code), _) => process::Ended::Code(code),
-        (None, Some(signal)) => process::Ended::Signal(signal),
-        (None, None) => return,
-    };
-    let Ok(said) = serde_json::to_vec(&ended) else {
-        return;
-    };
-    let mut beside = path.as_os_str().to_owned();
-    beside.push(".writing");
-    let beside = PathBuf::from(beside);
-    let written = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&beside)
-        .and_then(|mut file| file.write_all(&said))
-        .and_then(|()| std::fs::rename(&beside, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&beside);
-    }
-}
-
-/// A file opened for appending, made with mode 0600 if missing.
-fn append(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
+/// Starts `argv` detached (`steery_adapter_common::start`): launchd stops only the
+/// stopped job's own process group, so it outlives this adapter and the runtime. `scope` is
+/// ignored: launchd has no share of the CPU to run it in.
+pub fn start(start: process::Start) -> Result<process::Started, Error> {
+    steery_adapter_common::start(start, |pid| info(pid).map(|info| info.start))
 }
 
 /// Every process running, or those of `pids` that run, as [`entry`] reads each.
@@ -246,37 +154,6 @@ static ME: LazyLock<u32> = LazyLock::new(|| {
     // SAFETY: getuid takes nothing and cannot fail.
     unsafe { libc::getuid() }
 });
-
-/// The user's name from the password database, else the number.
-fn user_name(uid: u32) -> String {
-    let mut buffer = vec![0u8; 1024];
-    loop {
-        // SAFETY: passwd is plain data; getpwuid_r fills it or leaves `found` null.
-        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut found = ptr::null_mut();
-        // SAFETY: every pointer is valid for the length given.
-        let code = unsafe {
-            libc::getpwuid_r(
-                uid,
-                &mut entry,
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut found,
-            )
-        };
-        if code == libc::ERANGE && buffer.len() < 1 << 20 {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        if code != 0 || found.is_null() || entry.pw_name.is_null() {
-            return uid.to_string();
-        }
-        // SAFETY: pw_name points into `buffer`, NUL-terminated.
-        return unsafe { CStr::from_ptr(entry.pw_name) }
-            .to_string_lossy()
-            .into_owned();
-    }
-}
 
 /// The asked variables of a process, refused `not-found` unless the pid still has the
 /// given start time.

@@ -180,29 +180,49 @@ impl Provider {
         Ok(Self { api, key, http })
     }
 
-    /// The refusal `fail` is; `otherwise` where it is none of not found, auth or network.
+    /// The refusal `fail` is; `otherwise` where it is none of not found, key or down. A
+    /// refused key is `refused`, never `offline`: it does not heal by waiting, and its line
+    /// names the setting to give. OpenSandbox down is a gateway answering for it (HTTP 502,
+    /// 503, 504) as well as no answer at all (PROGRAMS.md §7).
     pub fn refuse(&self, fail: Fail, otherwise: &'static str) -> Error {
         let (word, line) = match fail {
-            Fail::Http { status: 404, line } => (refusal::NOT_FOUND, line),
+            Fail::Http { status: 404, line } => (refusal::NOT_FOUND, self.line(&line)),
             Fail::Http {
                 status: 401 | 403,
                 line,
-            } => (refusal::UNTRUSTED, line),
-            Fail::Http { line, .. } | Fail::Other(line) => (otherwise, line),
-            Fail::Offline(line) => (refusal::OFFLINE, line),
-            Fail::Refused(word, line) => (word, line),
+            } => (refusal::REFUSED, self.line_for_key(&line)),
+            Fail::Http {
+                status: 502..=504,
+                line,
+            }
+            | Fail::Offline(line) => (refusal::OFFLINE, self.line(&line)),
+            Fail::Http { line, .. } | Fail::Other(line) => (otherwise, self.line(&line)),
+            Fail::Refused(word, line) => (word, self.line(&line)),
         };
-        Error::refused(word, self.line(&line))
+        Error::refused(word, line)
+    }
+
+    /// The line for a key OpenSandbox refused, `said` being its answer.
+    fn line_for_key(&self, said: &str) -> String {
+        self.cut(&if self.key.is_some() {
+            format!("OpenSandbox refused the API key ({said}): give OPENSANDBOX_API_KEY again")
+        } else {
+            format!("OpenSandbox asks for an API key ({said}): give OPENSANDBOX_API_KEY")
+        })
     }
 
     /// One line for a person, never holding the API key.
     pub fn line(&self, said: &str) -> String {
-        let mut text = said.to_owned();
+        self.cut(&format!("OpenSandbox: {said}"))
+    }
+
+    /// `text` on one line of at most [`LINE`] characters, without the API key.
+    fn cut(&self, text: &str) -> String {
+        let mut text = text.to_owned();
         if let Some(key) = &self.key {
             text = text.replace(key.as_str(), "[redacted]");
         }
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let text = format!("OpenSandbox: {text}");
         if text.chars().count() > LINE {
             let mut cut: String = text.chars().take(LINE - 1).collect();
             cut.push('…');
@@ -498,6 +518,8 @@ fn failure(status: u16, body: &[u8], what: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
 
     fn provider(url: &str, key: Option<&str>) -> Result<Provider, String> {
         let mut settings = BTreeMap::from([("OPENSANDBOX_URL".to_owned(), url.to_owned())]);
@@ -550,10 +572,87 @@ mod tests {
             line: "bad sekrit".into(),
         };
         assert_eq!(word(http(404)), refusal::NOT_FOUND);
-        assert_eq!(word(http(401)), refusal::UNTRUSTED);
-        assert_eq!(word(http(403)), refusal::UNTRUSTED);
+        assert_eq!(word(http(401)), refusal::REFUSED);
+        assert_eq!(word(http(403)), refusal::REFUSED);
+        for down in [502, 503, 504] {
+            assert_eq!(word(http(down)), refusal::OFFLINE);
+        }
         assert_eq!(word(http(500)), refusal::REFUSED);
         assert_eq!(word(Fail::Offline("sekrit".into())), refusal::OFFLINE);
         assert_eq!(word(Fail::Other("x".into())), refusal::REFUSED);
+    }
+
+    /// An OpenSandbox on localhost that answers every request with `status` and `body`,
+    /// or, where `status` is none, takes every request and never answers. Its URL.
+    async fn answering(status: Option<u16>, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                match status {
+                    Some(status) => {
+                        let answer = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(answer.as_bytes()).await;
+                    }
+                    None => held.push(socket),
+                }
+            }
+        });
+        url
+    }
+
+    /// The refusal word and line listing sandboxes answers against an OpenSandbox
+    /// answering `status` with `body`, the key `sekrit` given where `key`.
+    async fn listed(status: u16, body: &'static str, key: bool) -> (String, String) {
+        let url = answering(Some(status), body).await;
+        let api = provider(&url, key.then_some("sekrit")).unwrap();
+        match api.refuse(
+            api.listed(&BTreeMap::new()).await.unwrap_err(),
+            refusal::REFUSED,
+        ) {
+            Error::Refused { word, line } => (word, line.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_is_refused_and_names_the_setting_to_give_again() {
+        let body = r#"{"code":"UNAUTHORIZED","message":"bad key sekrit"}"#;
+        assert_eq!(
+            listed(401, body, true).await,
+            (
+                refusal::REFUSED.to_owned(),
+                "OpenSandbox refused the API key (list sandboxes: HTTP 401 UNAUTHORIZED: bad key [redacted]): give OPENSANDBOX_API_KEY again"
+                    .to_owned()
+            )
+        );
+        let (word, line) = listed(403, body, false).await;
+        assert_eq!(word, refusal::REFUSED);
+        assert!(line.ends_with("give OPENSANDBOX_API_KEY"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn opensandbox_down_is_offline() {
+        for status in [502, 503, 504] {
+            let (word, line) = listed(status, "", true).await;
+            assert_eq!(word, refusal::OFFLINE, "{status}: {line}");
+        }
+        let url = answering(None, "").await;
+        let api = provider(&url, None).unwrap();
+        let hanging = api.http.get(&url).timeout(Duration::from_millis(300));
+        let fail = api.send(hanging, "list sandboxes").await.unwrap_err();
+        assert!(matches!(fail, Fail::Offline(_)), "{fail:?}");
     }
 }

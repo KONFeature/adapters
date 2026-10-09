@@ -1,0 +1,18 @@
+[package]
+name = "steery-adapter-common"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "What Steery's operating-system adapters share where POSIX behaves the same on each: a process started detached, how it ended, the files it writes to, and a user's name."
+
+[dependencies]
+steery-sdk = { path = "../../server/crates/steery-sdk" }
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "process"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "time"] }
+
+# Its own workspace, so it builds alone.
+[workspace]

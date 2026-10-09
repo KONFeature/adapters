@@ -48,10 +48,38 @@ async fn main() -> io::Result<()> {
     steery_sdk::serve(|_notifier| Adapter::default()).await
 }
 
-/// The adapter: a Daytona client once `initialize` gave an API key, and none before.
+/// The adapter: a Daytona client once `initialize` gave an API key, and none before; and
+/// whether this computer has the OpenSSH client its channels run.
 #[derive(Default)]
 struct Adapter {
     daytona: OnceLock<Option<Daytona>>,
+    ssh: OnceLock<bool>,
+}
+
+/// Why no channel can be had here: Daytona's runs `ssh` on the controlling computer, and
+/// waiting does not install one. Said by `sandbox/channel`, and by `sandboxes/list`, the
+/// first call `machine add` makes, so the machine is never added where it cannot work.
+const NO_SSH: &str = "Daytona's channel runs `ssh` on this computer, and none is installed: install an OpenSSH client (e.g. apt install openssh-client)";
+
+impl Adapter {
+    /// `ssh` is on `PATH`, as found when the adapter was initialized.
+    fn reach(&self) -> Result<(), Error> {
+        let found = *self
+            .ssh
+            .get_or_init(|| std::env::var_os("PATH").is_some_and(|path| ssh_within(&path)));
+        found
+            .then_some(())
+            .ok_or_else(|| Error::refused(refusal::REFUSED, NO_SSH))
+    }
+}
+
+/// Whether a folder of `path` (as `PATH` spells it) holds an executable `ssh`.
+fn ssh_within(path: &std::ffi::OsStr) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path).any(|dir| {
+        std::fs::metadata(dir.join("ssh"))
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
 }
 
 impl Program for Adapter {
@@ -74,6 +102,7 @@ impl Program for Adapter {
             None => None,
         };
         let _ = self.daytona.set(daytona);
+        let _ = self.reach();
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
@@ -119,11 +148,17 @@ impl Program for Adapter {
         use steery_sdk::{params as given, result};
         let daytona = || {
             self.daytona.get().and_then(Option::as_ref).ok_or_else(|| {
-                Error::refused(refusal::UNTRUSTED, "Daytona: DAYTONA_API_KEY is not set")
+                Error::refused(
+                    refusal::REFUSED,
+                    "Daytona: no API key was given: give DAYTONA_API_KEY",
+                )
             })
         };
         match method {
-            method::SANDBOXES_LIST => result(list(daytona()?, given(params)?).await?),
+            method::SANDBOXES_LIST => {
+                self.reach()?;
+                result(list(daytona()?, given(params)?).await?)
+            }
             method::SANDBOX_ENSURE => result(ensure(daytona()?, given(params)?).await?),
             method::SANDBOX_START => result(start(daytona()?, given(params)?).await?),
             method::SANDBOX_STOP => result(stop(daytona()?, given(params)?).await?),
@@ -131,7 +166,10 @@ impl Program for Adapter {
             method::SANDBOX_ARCHIVE => result(archive(daytona()?, given(params)?).await?),
             method::SANDBOX_KEEPALIVE => result(keepalive(daytona()?, given(params)?).await?),
             method::SANDBOX_PUT => result(put(daytona()?, given(params)?).await?),
-            method::SANDBOX_CHANNEL => result(channel(daytona()?, given(params)?).await?),
+            method::SANDBOX_CHANNEL => {
+                self.reach()?;
+                result(channel(daytona()?, given(params)?).await?)
+            }
             _ => Err(Error::Unknown),
         }
     }
@@ -146,29 +184,34 @@ fn setting(name: &str, secret: bool, required: bool, about: &str) -> wire::Setti
     }
 }
 
-/// The refusal a fault is; `otherwise` where it is none of not found, auth, network or time.
-/// Its line never holds the API key.
+/// The refusal a fault is; `otherwise` where it is none of not found, key, down or time.
+/// A refused key is `refused`, never `offline`: it does not heal by waiting, and its line
+/// names the setting to give again. Its line never holds the API key.
 fn refuse(daytona: &Daytona, fault: Fault, otherwise: &'static str) -> Error {
     let (word, line) = match fault {
-        Fault::NotFound(line) => (refusal::NOT_FOUND, line),
-        Fault::Untrusted(line) => (refusal::UNTRUSTED, line),
-        Fault::Offline(line) => (refusal::OFFLINE, line),
-        // Daytona was reached: a call that ran out of time is not offline.
-        Fault::TimedOut(line) => (refusal::REFUSED, format!("{line} (timed out)")),
-        Fault::Conflict(line) | Fault::Failed(line) => (otherwise, line),
+        Fault::NotFound(line) => (refusal::NOT_FOUND, format!("Daytona: {line}")),
+        Fault::KeyRefused { status, said } => (
+            refusal::REFUSED,
+            format!(
+                "Daytona refused the API key (HTTP {status}: {said}): give DAYTONA_API_KEY again"
+            ),
+        ),
+        Fault::Offline(line) => (refusal::OFFLINE, format!("Daytona: {line}")),
+        // Daytona answered, and the sandbox was not there in time.
+        Fault::TimedOut(line) => (refusal::REFUSED, format!("Daytona: {line} (timed out)")),
+        Fault::Conflict(line) | Fault::Failed(line) => (otherwise, format!("Daytona: {line}")),
     };
     Error::refused(word, one_line(daytona.key(), &line))
 }
 
-/// `Daytona: <text>` on one line, without `key`, at most [`LINE_CHARS`] characters.
+/// `text` on one line, without `key`, at most [`LINE_CHARS`] characters.
 fn one_line(key: &str, text: &str) -> String {
     let text = text.replace(key, "[redacted]");
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let text = match text.char_indices().nth(LINE_CHARS - 1) {
+    match text.char_indices().nth(LINE_CHARS - 1) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text,
-    };
-    format!("Daytona: {text}")
+    }
 }
 
 /// A sandbox's id, never empty.
@@ -421,7 +464,9 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
         .ok_or_else(|| fail(Fault::TimedOut(format!("no time left for {path}"))))?;
     let timed_out = match daytona.upload(&toolbox, &path, content, within).await {
         Ok(()) => false,
-        Err(Fault::TimedOut(_)) => true,
+        // No answer by the method's own bound: the file is too large to carry in it, a
+        // partial file may be there, and waiting for Daytona would not help.
+        Err(Fault::Offline(_)) if deadline.left().is_none() => true,
         Err(fault) => return Err(fail(fault)),
     };
     let written = daytona
@@ -430,7 +475,7 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
         .unwrap_or(0);
     if timed_out || written != length {
         let why = if timed_out {
-            format!("the upload timed out after {LONG_SECONDS} s")
+            format!("the upload got no answer in {LONG_SECONDS} s")
         } else {
             "the upload ended short".to_owned()
         };
@@ -444,7 +489,7 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
             one_line(
                 daytona.key(),
                 &format!(
-                    "{why}: {path} had {written} of {length} bytes written; {removed} (fetch a large file from inside the sandbox)"
+                    "Daytona: {why}: {path} had {written} of {length} bytes written; {removed} (fetch a large file from inside the sandbox)"
                 ),
             ),
         ));
@@ -544,8 +589,92 @@ mod tests {
     #[test]
     fn keeps_the_key_out_of_a_line() {
         assert_eq!(
-            one_line("sk", "bad  key sk\nhere"),
+            one_line("sk", "Daytona: bad  key sk\nhere"),
             "Daytona: bad key [redacted] here"
         );
+    }
+
+    /// The refusal word and line `sandboxes/list` answers against a Daytona answering
+    /// `status` with `body`.
+    async fn listed(status: u16, body: &'static str) -> (String, String) {
+        let url = api::tests::daytona_answering(Some(status), body).await;
+        let daytona = Daytona::new("sk-secret".into(), Some(&url), None).unwrap();
+        match list(&daytona, sandbox::List { labels: None }).await {
+            Err(Error::Refused { word, line }) => (word, line.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_is_refused_and_names_the_setting_to_give_again() {
+        assert_eq!(
+            listed(401, r#"{"message":"Invalid API key sk-secret"}"#).await,
+            (
+                refusal::REFUSED.to_owned(),
+                "Daytona refused the API key (HTTP 401: Invalid API key [redacted]): give DAYTONA_API_KEY again"
+                    .to_owned()
+            )
+        );
+        let (word, _) = listed(403, r#"{"message":"Forbidden resource"}"#).await;
+        assert_eq!(word, refusal::REFUSED);
+    }
+
+    #[tokio::test]
+    async fn daytona_down_is_offline() {
+        for status in [502, 503, 504] {
+            let (word, line) = listed(status, "").await;
+            assert_eq!(word, refusal::OFFLINE, "{line}");
+        }
+    }
+
+    /// Without `ssh` on this computer no channel can be had, so `sandbox/channel` refuses
+    /// `refused`, saying what to install, before it asks Daytona anything; and so does
+    /// `sandboxes/list`, the first call `machine add` makes.
+    #[tokio::test]
+    async fn without_an_ssh_client_a_channel_is_refused_saying_what_to_install() {
+        let without = Adapter {
+            daytona: OnceLock::from(None),
+            ssh: OnceLock::from(false),
+        };
+        let refused = |answer: Result<Value, Error>| match answer {
+            Err(Error::Refused { word, line }) => (word, line.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        };
+        let asked = serde_json::json!({"sandbox": "s", "command": ["steery", "serve"]});
+        for method in [method::SANDBOX_CHANNEL, method::SANDBOXES_LIST] {
+            let params = if method == method::SANDBOXES_LIST {
+                serde_json::json!({})
+            } else {
+                asked.clone()
+            };
+            assert_eq!(
+                refused(without.call(method, params).await),
+                (refusal::REFUSED.to_owned(), NO_SSH.to_owned()),
+                "{method}"
+            );
+        }
+        let with = Adapter {
+            daytona: OnceLock::from(None),
+            ssh: OnceLock::from(true),
+        };
+        let (_, line) = refused(with.call(method::SANDBOX_CHANNEL, asked).await);
+        assert!(line.contains("DAYTONA_API_KEY"), "{line}");
+    }
+
+    #[test]
+    fn an_ssh_client_is_found_on_path_only_where_it_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("steery-daytona-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (empty, held) = (dir.join("empty"), dir.join("held"));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&held).unwrap();
+        let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+        assert!(!ssh_within(&path(&[&empty])));
+        std::fs::write(held.join("ssh"), "#!/bin/sh\n").unwrap();
+        assert!(!ssh_within(&path(&[&empty, &held])), "not executable");
+        std::fs::set_permissions(held.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ssh_within(&path(&[&empty, &held])));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

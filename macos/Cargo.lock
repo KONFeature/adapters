@@ -125,11 +125,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "steery-adapter-common"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "steery-sdk",
+ "tokio",
+]
+
+[[package]]
 name = "steery-adapter-macos"
 version = "0.1.0"
 dependencies = [
  "libc",
  "serde_json",
+ "steery-adapter-common",
  "steery-sdk",
  "tokio",
 ]
