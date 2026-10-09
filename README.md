@@ -15,6 +15,19 @@ daytona/     a Node program: the Daytona adapter; and a Bun CLI: up, logs, statu
 opensandbox/ a Node program: the OpenSandbox adapter
 ```
 
+## Building
+
+The SDKs and the protocol live in Steery's own repository until they are published. Check
+it out beside this one, as `server`; the Rust adapters use `../server/crates/steery-sdk`
+and the Node ones `../server/sdk/typescript` (build that first with `npm run build`).
+
+```sh
+git clone https://github.com/steery-dev/server
+git clone https://github.com/steery-dev/adapters
+cd adapters/linux && cargo build
+steery adapter test target/debug/steery-adapter-linux
+```
+
 ## linux
 
 `linux/` provides `processes` on Linux: it starts turns detached (in a systemd user scope

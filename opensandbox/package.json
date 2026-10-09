@@ -18,7 +18,7 @@
     "build": "tsc"
   },
   "dependencies": {
-    "@steery/sdk": "file:../../steery-sdk-20261009/sdk/typescript"
+    "@steery/sdk": "file:../../server/sdk/typescript"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

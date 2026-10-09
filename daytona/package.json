@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@daytona/sdk": "0.223.0",
-    "@steery/sdk": "file:../../steery-sdk-20261009/sdk/typescript"
+    "@steery/sdk": "file:../../server/sdk/typescript"
   },
   "devDependencies": {
     "@types/bun": "1.4.2",

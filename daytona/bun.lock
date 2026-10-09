@@ -5,7 +5,7 @@
       "name": "@steery/adapter-daytona",
       "dependencies": {
         "@daytona/sdk": "0.223.0",
-        "@steery/sdk": "file:../../steery-sdk-20261009/sdk/typescript",
+        "@steery/sdk": "file:../../server/sdk/typescript",
       },
       "devDependencies": {
         "@types/bun": "1.4.2",
@@ -175,7 +175,7 @@
 
     "@socket.io/component-emitter": ["@socket.io/component-emitter@3.1.2", "", {}, "sha512-9BCxFwvbGg/RsZK9tjXd8s4UcwR0MWeFQ1XEKIQVVvAGJyINdrqKMcTRyLoK8Rse1GjzLV9cwjWV1olXRWEXVA=="],
 
-    "@steery/sdk": ["@steery/sdk@file:../../steery-sdk-20261009/sdk/typescript", { "devDependencies": { "@types/node": "^22.20.5", "json-schema-to-typescript": "^16.0.0", "typescript": "^5.9.3" } }],
+    "@steery/sdk": ["@steery/sdk@file:../../server/sdk/typescript", { "devDependencies": { "@types/node": "^22.20.5", "json-schema-to-typescript": "^16.0.0", "typescript": "^5.9.3" } }],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 
