@@ -241,6 +241,8 @@ fn entry(pid: u32, users: &mut BTreeMap<u32, String>) -> Option<process::Entry> 
         command,
         args,
         user,
+        // Unreadable for another user's process unless this runs as root.
+        cwd: fs::read_link(format!("/proc/{pid}/cwd")).ok(),
     })
 }
 

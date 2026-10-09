@@ -160,7 +160,33 @@ fn entry(
         command: info.command,
         args,
         user,
+        cwd: cwd(pid),
     })
+}
+
+/// The folder a process works in now; none where it is gone or this user may not read it.
+fn cwd(pid: u32) -> Option<PathBuf> {
+    let pid = c_int::try_from(pid).ok()?;
+    // SAFETY: proc_vnodepathinfo is plain data.
+    let mut paths: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<libc::proc_vnodepathinfo>() as c_int;
+    // SAFETY: the buffer is valid for `size` bytes.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut paths).cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    let path = PathBuf::from(OsString::from_vec(bytes_of(
+        paths.pvi_cdir.vip_path.as_flattened(),
+    )));
+    path.is_absolute().then_some(path)
 }
 
 /// The user this adapter runs as.
