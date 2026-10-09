@@ -1,39 +1,111 @@
 # Steery adapters
 
-Open adapters for [Steery](https://steery.dev). An adapter connects Steery to one kind of
-machine: an operating system (`macos`, `linux`) or a sandbox provider (`daytona`,
-`opensandbox`). Drivers, one per agent harness, live in `steery-dev/drivers`.
+An adapter connects [Steery](https://steery.dev) to one kind of machine: an operating system
+(`macos`, `linux`) or a sandbox provider (`daytona`, `opensandbox`). The Steery runtime
+starts an adapter as a child process and speaks the program protocol to it, JSON-RPC 2.0
+over standard input and output (`specs/PROTOCOL.md` in Steery's repository). Drivers, one
+per agent harness, live in `steery-dev/drivers`.
 
-Four adapters exist today: `macos`, `linux`, `daytona`, which provides Daytona sandboxes,
-and `opensandbox`, which provides OpenSandbox sandboxes. An operating-system adapter's id
-is the name Rust gives that system (`std::env::consts::OS`): the runtime runs the one
-named for the system it runs on.
+Each adapter is its own program, `steery-adapter-<id>`, built on the `steery-sdk` crate,
+and answers version 1 of the program protocol. The four below are official: they ship in
+Steery's release archive, beside `steery`, each built from this repository at the commit
+`programs.lock` in Steery's repository names, and update with it; an operating-system
+adapter ships only in that system's archives. Its id is the name Rust gives that system
+(`std::env::consts::OS`), and the runtime runs the one named for the system it runs on.
 
 ```
-macos/       a Rust binary: the official macOS adapter
-linux/       a Rust binary: the official Linux adapter
-daytona/     a Rust binary: the official Daytona adapter
-opensandbox/ a Rust binary: the official OpenSandbox adapter
+macos/       steery-adapter-macos: processes on macOS
+linux/       steery-adapter-linux: processes on Linux
+daytona/     steery-adapter-daytona: Daytona sandboxes
+opensandbox/ steery-adapter-opensandbox: OpenSandbox sandboxes
 ```
+
+Each crate is a Cargo workspace of its own, with its own `Cargo.lock`, so it builds alone.
 
 ## Building
 
-The SDKs and the protocol live in Steery's own repository until they are published. Check
-it out beside this one, as `server`; every adapter uses `../server/crates/steery-sdk`.
+The SDK and the protocol live in Steery's own repository. Every crate names the SDK by path,
+`steery-sdk = { path = "../../server/crates/steery-sdk" }`, so check Steery's repository out
+beside this one as `server`:
 
 ```sh
 git clone https://github.com/steery-dev/server
 git clone https://github.com/steery-dev/adapters
 cd adapters/linux && cargo build
+```
+
+A release builds each official adapter the same way, from its own crate, with `--locked` and
+the `ship` profile of Steery's `Cargo.toml` (`deploy/compile-cli.sh` in Steery's
+repository):
+
+```sh
+cargo build --profile ship --locked --config <ship profile> \
+  --manifest-path linux/Cargo.toml --bin steery-adapter-linux
+```
+
+## Checking an adapter
+
+```sh
 steery adapter test target/debug/steery-adapter-linux
 ```
+
+`steery adapter test <command> [args…] [--setting NAME[=VALUE]]` starts the adapter and
+checks what it says it is, the methods that read and change nothing, an id sent twice, a
+method it does not have, and its shutdown, one line per check; it exits 0 only when every
+one passes. A read answered with a refusal word its method lists is an answer.
+`--setting NAME=VALUE` passes a setting to `initialize`, and `--setting NAME` takes its
+value from the environment, keeping a secret off the command line; a method that needs a
+required setting not given is skipped. `daytona` and `opensandbox` also have their own
+`cargo test`.
+
+## Writing an adapter
+
+An adapter for a machine Steery does not ship is a program like these. `linux/` is the
+worked example: one file, `src/main.rs`.
+
+- **Its crate** depends on `steery-sdk` by path as above, with `tokio` for its runtime and
+  `serde_json` for the parameters, and declares an empty `[workspace]` so it builds alone.
+  Its binary is named `steery-adapter-<id>`; `main` is
+  `steery_sdk::serve(|_notifier| Linux::default())`. The SDK reads requests, answers each
+  one, and gives the notifier for what the adapter says unasked (a `stream` channel's
+  `stream/data` and `stream/closed`).
+- **`initialize`** (`Program::initialize`) refuses a runtime that does not offer
+  `steery_sdk::PROTOCOL`, keeps the `home` it is given, and answers `wire::Initialized`:
+  `program` (`id: "linux"`, `kind: Machine`, `release`, `label: "Linux"`), no `harness`,
+  `machine` (`wire::Machine::Processes` with `os: Linux` and `service: Systemd`; a sandbox
+  provider answers `Sandboxes` with what it keeps, how it idles, its optional methods and
+  its channel; PROTOCOL.md §3.2), and the settings it needs (none here; `daytona` and
+  `opensandbox` declare theirs, §3.4).
+- **The methods** (`Program::call`) are one match from each `steery_sdk::method` name to the
+  function that answers it, its parameters read with `steery_sdk::params` and its answer
+  given with `steery_sdk::result`: `process/*` and `service/*` for `processes` (§5.1),
+  `sandboxes/list` and `sandbox/*` for `sandboxes` (§5.2), `stream/*` for a `stream`
+  channel (§5.3); any other answers `Error::Unknown`. A refusal is `Error::refused` with
+  one of the protocol's words (`steery_sdk::refusal`).
+
+## Adding an adapter to an install
+
+An official adapter ships in Steery's archive, beside `steery`. Any other is added by hand:
+a record in Steery's config folder, `$XDG_CONFIG_HOME/steery`, else `~/.config/steery` (on
+a sandbox machine its own folder, `machines/<name>` in it), at `adapters/<id>.json`:
+
+```json
+{"id": "my-cloud", "kind": "machine",
+ "command": "/opt/steery/steery-adapter-my-cloud", "args": [],
+ "source": "https://github.com/me/steery-adapter-my-cloud", "release": "0.1.0",
+ "digest": "sha256:<64 lowercase hex>"}
+```
+
+`digest` is `sha256:` and the SHA-256 of the file `command` names, in lowercase hex
+(`sha256sum`); it is checked before every start, and a command whose digest changed is not
+started until the record is written again. `args` may be left out; no other field is read.
+An id an official adapter has can never be taken: the official one is started and the
+record is ignored. There is no `steery adapter add`.
 
 ## linux
 
 `linux/` provides `processes` on Linux (`initialize` answers
-`machine: {provides: "processes", os: "linux", service: "systemd"}`). It ships with
-`steery` and updates with it, and speaks the program protocol over standard input and
-output through `steery-sdk`.
+`machine: {provides: "processes", os: "linux", service: "systemd"}`).
 
 - `process/start` starts a turn detached, in a session of its own, with exactly the
   environment it is given. With a `scope` naming the service the runtime runs as under
@@ -141,7 +213,7 @@ check it:
 
 ```sh
 cd daytona && cargo build && cargo clippy && cargo test
-steery adapter test target/debug/steery-adapter-daytona --setting DAYTONA_API_KEY=…
+DAYTONA_API_KEY=… steery adapter test target/debug/steery-adapter-daytona --setting DAYTONA_API_KEY
 ```
 
 With the key, the check also lists your sandboxes (`sandboxes/list`); it makes none.
@@ -202,11 +274,13 @@ It reads them from `initialize` only, never from its environment. Build and chec
 ```sh
 cd opensandbox && cargo build && cargo clippy && cargo test
 steery adapter test target/debug/steery-adapter-opensandbox \
-  --setting OPENSANDBOX_URL=http://localhost:8080 --setting OPENSANDBOX_API_KEY=…
+  --setting OPENSANDBOX_URL=http://localhost:8080 --setting OPENSANDBOX_API_KEY
 ```
 
 The check lists sandboxes on the server it is given; a local server is the
-`opensandbox/server` image with the Docker runtime (its `server/docker-compose.example.yaml`).
+`opensandbox/server` image (`opensandbox/server:release-1.1.0`, which runs sandboxes with
+`opensandbox/execd:v1.1.0`) with the Docker runtime, as its
+`server/docker-compose.example.yaml` sets it up.
 
 ## What Steery adds to a sandbox
 
