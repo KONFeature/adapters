@@ -333,7 +333,11 @@ pub async fn listening(listening: process::Listening) -> Result<process::Listene
 /// its output appended to `log`. It keeps every directory of the `PATH` the plist on
 /// disk gave it. The commands unload the job an earlier plist loaded, which fails where
 /// none is and may, enable it, which an earlier `launchctl disable` would otherwise keep
-/// from loading, and load it in this user's GUI domain.
+/// from loading, and load it in this user's GUI domain. `bootout` returns while the old
+/// job is still stopping (up to its `ExitTimeOut`), and a `bootstrap` then fails with
+/// launchd's error 5 until it has gone: an update that replaced the plist was left with no
+/// runtime at all (2026-10-09, 6.12.0). So the load is tried again each second until the
+/// old job is gone or [`STOP_GRACE_SECS`] and a few more have passed.
 pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::Plan, Error> {
     let label = launchd_label(&plan.label)?;
     if !(1..=100).contains(&plan.cpu) {
@@ -408,7 +412,7 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
     let commands = vec![
         launchctl(&["bootout", &target], true),
         launchctl(&["enable", &target], false),
-        launchctl(&["bootstrap", &domain(), &path.to_string_lossy()], false),
+        bootstrap_after_stop(&path),
     ];
     Ok(process::Plan {
         files: vec![process::PlannedFile {
@@ -419,6 +423,32 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
         commands,
     })
 }
+
+/// The `launchctl bootstrap` of `path` into this user's GUI domain, tried again once a
+/// second while launchd still answers that the job is busy stopping, for the stop grace
+/// and [`BOOTSTRAP_SLACK_SECS`] more; any other failure, or the last one, is the plan's.
+fn bootstrap_after_stop(path: &Path) -> process::PlanCommand {
+    let tries = STOP_GRACE_SECS + BOOTSTRAP_SLACK_SECS;
+    let script = format!(
+        "i=0; while :; do out=$(launchctl bootstrap \"$1\" \"$2\" 2>&1) && exit 0; \
+         i=$((i+1)); case \"$out\" in *\"Bootstrap failed: 5:\"*) [ $i -lt {tries} ] && \
+         {{ sleep 1; continue; }};; esac; printf '%s\\n' \"$out\" >&2; exit 1; done"
+    );
+    process::PlanCommand {
+        argv: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            script,
+            "steery-bootstrap".to_owned(),
+            domain(),
+            path.to_string_lossy().into_owned(),
+        ],
+        may_fail: false,
+    }
+}
+
+/// How many seconds past the stop grace a load keeps waiting for the old job to go.
+const BOOTSTRAP_SLACK_SECS: u64 = 10;
 
 /// Whether the agent's plist is on disk, whether launchd runs it and as which process,
 /// and the CPU this Mac grants the user: all its online cores.
