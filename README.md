@@ -4,10 +4,11 @@ Open adapters for [Steery](https://steery.dev). An adapter connects Steery to on
 machine: an operating system (`mac`, `linux`) or a sandbox provider (`daytona`,
 `opensandbox`). Drivers, one per agent harness, live in `steery-dev/drivers`.
 
-Two adapters exist today: `linux`, and the first step of `daytona`, where one Daytona
-sandbox runs as one Steery machine.
+Three adapters exist today: `mac`, `linux`, and the first step of `daytona`, where one
+Daytona sandbox runs as one Steery machine.
 
 ```
+mac/         a Rust binary: the official macOS adapter
 linux/       a Rust binary: the official Linux adapter
 daytona/     a Bun CLI: up, logs, status, down
 ```
@@ -19,6 +20,18 @@ when one is reachable), lists processes and reads their environment and open fil
 `/proc`, signals only a process whose start time still matches, and plans the systemd
 user unit that keeps the runtime running. It ships with `steery` and updates with it.
 It speaks the program protocol over standard input and output through `steery-sdk`.
+
+## mac
+
+`mac/` provides `processes` on macOS: it starts turns detached in a session of their own,
+lists processes through libproc and reads their arguments and environment through
+`sysctl` (`KERN_PROCARGS2`) and their open files through `proc_pidfdinfo`, signals only a
+process whose start time still matches, and plans the LaunchAgent that keeps the runtime
+running (`~/Library/LaunchAgents/<label>.plist`, logs in `~/Library/Logs/<label>.log`),
+loaded with `launchctl bootstrap gui/<uid>`. launchd has no user scopes, so a start's
+`scope` is ignored. macOS lets a user read only its own processes' details, so another
+user's processes are left out unless it runs as root. It ships with `steery` and updates
+with it. Built for another system it answers `initialize` and refuses every method.
 
 ## What Steery adds to a sandbox
 
