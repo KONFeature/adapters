@@ -1,0 +1,21 @@
+[package]
+name = "steery-adapter-opensandbox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Steery's adapter for OpenSandbox: it makes, starts, pauses and deletes sandboxes, writes files into them and carries a stream to a command inside one."
+
+[dependencies]
+steery-sdk = { path = "../../server/crates/steery-sdk" }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
+
+# Its own workspace, so it builds alone.
+[workspace]
