@@ -57,8 +57,9 @@ struct Adapter {
 }
 
 /// Why no channel can be had here: Daytona's runs `ssh` on the controlling computer, and
-/// waiting does not install one. Said by `sandbox/channel`, and by `sandboxes/list`, the
-/// first call `machine add` makes, so the machine is never added where it cannot work.
+/// waiting does not install one. Said by `initialize` as `unavailable` (PROTOCOL.md §3.2),
+/// so the machine is never added where it cannot work, and by `sandbox/channel` and
+/// `sandboxes/list` as the guard where it is used.
 const NO_SSH: &str = "Daytona's channel runs `ssh` on this computer, and none is installed: install an OpenSSH client (e.g. apt install openssh-client)";
 
 impl Adapter {
@@ -102,7 +103,9 @@ impl Program for Adapter {
             None => None,
         };
         let _ = self.daytona.set(daytona);
-        let _ = self.reach();
+        // Said up front (PROTOCOL.md §3.2), so no machine is added where its channel cannot
+        // run; the channel and the list still refuse, as the guard where it is used.
+        let unavailable = self.reach().err().map(|_| NO_SSH.to_owned());
         Ok(wire::Initialized {
             protocol: PROTOCOL,
             program: wire::ProgramInfo {
@@ -120,6 +123,7 @@ impl Program for Adapter {
                 optional: vec![wire::Optional::Archive, wire::Optional::Keepalive],
                 channel: wire::Channel::Argv,
                 os: wire::Os::Linux,
+                unavailable,
             })),
             settings: vec![
                 setting(
@@ -659,6 +663,30 @@ mod tests {
         };
         let (_, line) = refused(with.call(method::SANDBOX_CHANNEL, asked).await);
         assert!(line.contains("DAYTONA_API_KEY"), "{line}");
+    }
+
+    /// `initialize` says up front that no sandbox can be had from a computer without
+    /// `ssh` (PROTOCOL.md §3.2), so `machine add` refuses before it writes anything.
+    #[test]
+    fn without_an_ssh_client_initialize_says_daytona_is_unavailable_here() {
+        let params: wire::InitializeParams = serde_json::from_value(serde_json::json!({
+            "protocol": [PROTOCOL],
+            "runtime": {"release": "6.10.3", "os": "linux", "arch": "x86_64"},
+            "home": "/home/p", "config": "/home/p/.config/steery",
+        }))
+        .unwrap();
+        let unavailable = |ssh: bool| {
+            let adapter = Adapter {
+                daytona: OnceLock::new(),
+                ssh: OnceLock::from(ssh),
+            };
+            match adapter.initialize(&params).unwrap().machine {
+                Some(wire::Machine::Sandboxes(facts)) => facts.unavailable,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(unavailable(false).as_deref(), Some(NO_SSH));
+        assert_eq!(unavailable(true), None);
     }
 
     #[test]

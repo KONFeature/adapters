@@ -132,6 +132,7 @@ impl Program for OpenSandbox {
                 optional: vec![wire::Optional::Pause, wire::Optional::Keepalive],
                 channel: wire::Channel::Stream,
                 os: wire::Os::Linux,
+                unavailable: None,
             })),
             settings: vec![
                 wire::Setting {
