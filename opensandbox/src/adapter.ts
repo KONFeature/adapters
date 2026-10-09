@@ -510,19 +510,17 @@ async function close(params: wire.StreamClose): Promise<Record<string, never>> {
 await serve((notify) => ({
   initialize(params): wire.Initialized {
     settings = { ...(params.settings ?? {}) };
-    const facts: wire.SandboxFacts = {
-      keeps: "filesystem",
-      persist: null,
-      idle: "ttl",
-      optional: ["pause", "keepalive"],
-      channel: "stream",
-      os: "linux",
-    };
     return {
       protocol: PROTOCOL,
       program: { id: "opensandbox", kind: "machine", release: RELEASE, label: "OpenSandbox" },
-      provides: "sandboxes",
-      facts,
+      machine: {
+        provides: "sandboxes",
+        keeps: "filesystem",
+        idle: "ttl",
+        optional: ["pause", "keepalive"],
+        channel: "stream",
+        os: "linux",
+      },
       settings: [
         {
           name: "OPENSANDBOX_URL",

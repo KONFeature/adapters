@@ -272,19 +272,17 @@ await serve({
   initialize(params): wire.Initialized {
     settings = { ...(params.settings ?? {}) };
     client = undefined;
-    const facts: wire.SandboxFacts = {
-      keeps: "filesystem",
-      persist: null,
-      idle: "activity",
-      optional: ["archive", "keepalive"],
-      channel: "argv",
-      os: "linux",
-    };
     return {
       protocol: PROTOCOL,
       program: { id: "daytona", kind: "machine", release: RELEASE, label: "Daytona" },
-      provides: "sandboxes",
-      facts,
+      machine: {
+        provides: "sandboxes",
+        keeps: "filesystem",
+        idle: "activity",
+        optional: ["archive", "keepalive"],
+        channel: "argv",
+        os: "linux",
+      },
       settings: [
         { name: "DAYTONA_API_KEY", secret: true, required: true, about: "An API key from app.daytona.io/dashboard/keys" },
         { name: "DAYTONA_API_URL", secret: false, required: false, about: "Your Daytona API URL, for a self-hosted Daytona; absent: https://app.daytona.io/api" },
