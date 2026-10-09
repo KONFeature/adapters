@@ -4,13 +4,15 @@ Open adapters for [Steery](https://steery.dev). An adapter connects Steery to on
 machine: an operating system (`mac`, `linux`) or a sandbox provider (`daytona`,
 `opensandbox`). Drivers, one per agent harness, live in `steery-dev/drivers`.
 
-Three adapters exist today: `mac`, `linux`, and `daytona`, which provides Daytona
-sandboxes; beside it, Step A's `up` runs one Daytona sandbox as one Steery machine.
+Four adapters exist today: `mac`, `linux`, `daytona`, which provides Daytona sandboxes,
+and `opensandbox`, which provides OpenSandbox sandboxes; beside `daytona`, Step A's `up`
+runs one Daytona sandbox as one Steery machine.
 
 ```
 mac/         a Rust binary: the official macOS adapter
 linux/       a Rust binary: the official Linux adapter
 daytona/     a Node program: the Daytona adapter; and a Bun CLI: up, logs, status, down
+opensandbox/ a Node program: the OpenSandbox adapter
 ```
 
 ## linux
@@ -56,6 +58,49 @@ It reads them from `initialize` only, never from its environment or a `.env` fil
 with `npm run build` in `daytona/`; the program is `dist/adapter.js`
 (`steery-adapter-daytona`), and `steery adapter test node daytona/dist/adapter.js` checks
 it. `up` (Step A, below) remains, for running the whole runtime inside one sandbox.
+
+## opensandbox
+
+`opensandbox/` provides `sandboxes` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox),
+through its lifecycle API and the execd daemon in each sandbox, with `fetch` and Node's
+`WebSocket` and no provider SDK:
+
+- `sandboxes/list`: the sandboxes whose metadata holds `steery=sandbox` and every label asked.
+- `sandbox/ensure`: finds the sandbox whose metadata holds `steery-key=<key>`, or makes one
+  from the image (`image.uri`) or snapshot (`snapshotId`) the runtime names. OpenSandbox
+  has no default image, so with neither it refuses `no-place`. A sandbox made from an image
+  is given the entrypoint `tail -f /dev/null`, because the API requires one; its resource
+  limits are left empty, so the server's own apply. Metadata keys and values follow
+  Kubernetes label rules (63 characters; letters, digits, `-`, `_`, `.`), so a key or label
+  outside them is refused by the server.
+- `sandbox/start` resumes a paused sandbox and waits until it runs; `stop` and `pause`
+  pause it (OpenSandbox's only stop that keeps it); `delete` deletes it. Its filesystem
+  survives a pause.
+- `sandbox/keepalive` renews the expiration by the TTL the server gave it when it was made,
+  or by an hour; a sandbox with no expiration needs none. The adapter sets no timeout of its
+  own, so the server's default is the sandbox's idle timer.
+- `sandbox/put` uploads the file through execd (`/files/upload`) with its mode.
+- `sandbox/channel` is a `stream` channel: it opens a pipe-mode PTY session in execd running
+  the command (`POST /pty`) and joins its WebSocket (`/pty/{id}/ws?pty=0`), reached through
+  the sandbox's endpoint for port 44772 and the headers that endpoint names.
+  `stream/write` sends standard-input frames; standard output comes back as `stream/data`,
+  standard error goes to the adapter's log, and `stream/closed` carries the exit code.
+  execd has no frame that closes only standard input, so `stream/close` sends the command
+  SIGHUP, ends the session after two seconds if it still runs, and closes the socket.
+
+Errors read as `not-found` (HTTP 404), `untrusted` (401, 403), `offline` (the server cannot
+be reached), `start-failed` (a sandbox that could not be made or resumed) or `refused`.
+
+Its settings, given once on the card the runtime raises when it is added:
+
+| Setting | | |
+|---|---|---|
+| `OPENSANDBOX_URL` | required | your OpenSandbox server, as its SDKs take it: `http://localhost:8080` |
+| `OPENSANDBOX_API_KEY` | secret, optional | the server's `server.api_key`, where it has one |
+
+It reads them from `initialize` only. Build it with `npm install && npm run build` in
+`opensandbox/`; the program is `dist/adapter.js` (`steery-adapter-opensandbox`), and
+`steery adapter test node opensandbox/dist/adapter.js` checks it.
 
 ## What Steery adds to a sandbox
 
