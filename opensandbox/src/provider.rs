@@ -1,6 +1,10 @@
 //! OpenSandbox's published HTTP APIs: the lifecycle API (`specs/sandbox-lifecycle.yml`) and
-//! the execd daemon inside each sandbox (`specs/execd-api.yaml`), and how their errors read
+//! the execd daemon inside each host (`specs/execd-api.yaml`), and how their errors read
 //! as refusals.
+//!
+//! A host is what OpenSandbox's lifecycle API serves under `/sandboxes`; that path, its key
+//! header and its spec's file name are OpenSandbox's words, sent as they are. Every item
+//! here is named by Steery's: [`Found`] is a host as the API answers it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -14,9 +18,9 @@ use url::Url;
 
 /// The header the lifecycle API reads its key from.
 const KEY_HEADER: &str = "OPEN-SANDBOX-API-KEY";
-/// The port execd listens on inside every sandbox.
+/// The port execd listens on inside every host.
 const EXECD_PORT: &str = "44772";
-/// How long one request to OpenSandbox may take where it makes or resumes a sandbox, or
+/// How long one request to OpenSandbox may take where it makes or resumes a host, or
 /// carries a file, inside the runtime's bound of 300 s (PROTOCOL.md §9).
 pub const MAKE: Duration = Duration::from_secs(280);
 /// How long one request may take for anything else, inside the runtime's 60 s.
@@ -86,7 +90,7 @@ pub fn chain(error: &dyn std::error::Error) -> String {
     line
 }
 
-/// A sandbox as the lifecycle API answers it.
+/// A host as the lifecycle API answers it.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Found {
@@ -99,7 +103,7 @@ pub struct Found {
     pub expires_at: Option<String>,
 }
 
-/// A sandbox's state, as the lifecycle API answers it.
+/// A host's state, as the lifecycle API answers it.
 #[derive(Debug, Deserialize)]
 pub struct Status {
     pub state: String,
@@ -120,7 +124,7 @@ struct Pagination {
     has_next_page: bool,
 }
 
-/// Where execd answers for one sandbox, and the headers its endpoint names.
+/// Where execd answers for one host, and the headers its endpoint names.
 #[derive(Debug, Clone)]
 pub struct Execd {
     base: Url,
@@ -273,7 +277,7 @@ impl Provider {
     }
 
     pub async fn get(&self, id: &str) -> Result<Found, Fail> {
-        let what = "get sandbox";
+        let what = "get host";
         read(
             what,
             &self
@@ -282,9 +286,9 @@ impl Provider {
         )
     }
 
-    /// Every sandbox whose metadata holds all of `metadata`, page by page.
+    /// Every host whose metadata holds all of `metadata`, page by page.
     pub async fn listed(&self, metadata: &BTreeMap<String, String>) -> Result<Vec<Found>, Fail> {
-        let what = "list sandboxes";
+        let what = "list hosts";
         // The filter is one parameter of `key=value` pairs, each encoded, and then encoded
         // whole as the parameter's value.
         let filter = url::form_urlencoded::Serializer::new(String::new())
@@ -308,7 +312,7 @@ impl Provider {
     }
 
     pub async fn create(&self, body: &Value) -> Result<Found, Fail> {
-        let what = "create sandbox";
+        let what = "create host";
         let request = self.lifecycle(Method::POST, &["sandboxes"]).json(body);
         read(what, &self.send(request, what).await?)
     }
@@ -318,13 +322,13 @@ impl Provider {
             .lifecycle(Method::PATCH, &["sandboxes", id, "metadata"])
             .json(patch)
             .timeout(CHANGE);
-        self.send(request, "patch sandbox metadata").await.map(drop)
+        self.send(request, "patch host metadata").await.map(drop)
     }
 
     /// `POST /sandboxes/{id}/{action}`: `pause` or `resume`.
     pub async fn act(&self, id: &str, action: &str) -> Result<(), Fail> {
         let request = self.lifecycle(Method::POST, &["sandboxes", id, action]);
-        self.send(request, &format!("{action} sandbox"))
+        self.send(request, &format!("{action} host"))
             .await
             .map(drop)
     }
@@ -333,19 +337,19 @@ impl Provider {
         let request = self
             .lifecycle(Method::DELETE, &["sandboxes", id])
             .timeout(CHANGE);
-        self.send(request, "delete sandbox").await.map(drop)
+        self.send(request, "delete host").await.map(drop)
     }
 
-    /// Set the sandbox's expiration to `expires_at` (RFC 3339).
+    /// Set the host's expiration to `expires_at` (RFC 3339).
     pub async fn renew(&self, id: &str, expires_at: &str) -> Result<(), Fail> {
         let request = self
             .lifecycle(Method::POST, &["sandboxes", id, "renew-expiration"])
             .json(&json!({ "expiresAt": expires_at }))
             .timeout(CHANGE);
-        self.send(request, "renew sandbox").await.map(drop)
+        self.send(request, "renew host").await.map(drop)
     }
 
-    /// Where the sandbox's execd answers: its endpoint for port 44772, with the headers it
+    /// Where the host's execd answers: its endpoint for port 44772, with the headers it
     /// names.
     pub async fn execd(&self, id: &str) -> Result<Execd, Fail> {
         #[derive(Deserialize)]
@@ -613,7 +617,7 @@ mod tests {
         url
     }
 
-    /// The refusal word and line listing sandboxes answers against an OpenSandbox
+    /// The refusal word and line listing hosts answers against an OpenSandbox
     /// answering `status` with `body`, the key `sekrit` given where `key`.
     async fn listed(status: u16, body: &'static str, key: bool) -> (String, String) {
         let url = answering(Some(status), body).await;
@@ -634,7 +638,7 @@ mod tests {
             listed(401, body, true).await,
             (
                 refusal::REFUSED.to_owned(),
-                "OpenSandbox refused the API key (list sandboxes: HTTP 401 UNAUTHORIZED: bad key [redacted]): give OPENSANDBOX_API_KEY again"
+                "OpenSandbox refused the API key (list hosts: HTTP 401 UNAUTHORIZED: bad key [redacted]): give OPENSANDBOX_API_KEY again"
                     .to_owned()
             )
         );
@@ -652,7 +656,7 @@ mod tests {
         let url = answering(None, "").await;
         let api = provider(&url, None).unwrap();
         let hanging = api.http.get(&url).timeout(Duration::from_millis(300));
-        let fail = api.send(hanging, "list sandboxes").await.unwrap_err();
+        let fail = api.send(hanging, "list hosts").await.unwrap_err();
         assert!(matches!(fail, Fail::Offline(_)), "{fail:?}");
     }
 }

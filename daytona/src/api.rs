@@ -1,6 +1,10 @@
 //! Daytona's published REST API, as far as this adapter calls it: the control plane
-//! (`openapi.json`: sandboxes, their lifecycle, SSH access) and each sandbox's toolbox
+//! (`openapi.json`: hosts, their lifecycle, SSH access) and each host's toolbox
 //! (`toolbox-openapi.json`: its files), reached through the toolbox proxy Daytona names.
+//!
+//! A host is what Daytona's API serves under `/sandbox`; that path is Daytona's word and is
+//! sent as it is. Every item here is named by Steery's words: [`Host`] is one as Daytona
+//! answers it.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -14,13 +18,13 @@ use tokio::time::Instant;
 /// Daytona's own API, where the person names none.
 pub const DEFAULT_API: &str = "https://app.daytona.io/api";
 
-/// Most sandboxes one page of `GET /sandbox` holds.
+/// Most hosts one page of `GET /sandbox` holds.
 const PAGE: u32 = 200;
 
 /// How a call to Daytona failed.
 #[derive(Debug)]
 pub enum Fault {
-    /// Daytona has no such sandbox or file (HTTP 404).
+    /// Daytona has no such host or file (HTTP 404).
     NotFound(String),
     /// Daytona refused the API key (HTTP 401, 403), and what it said: a key that does not
     /// heal by waiting, given again by the person.
@@ -28,18 +32,18 @@ pub enum Fault {
     /// Daytona is down: not reached, a gateway that answers for it (HTTP 502, 503, 504),
     /// or a request that got no answer in its time.
     Offline(String),
-    /// Daytona answered, and the sandbox did not reach the state asked for in time.
+    /// Daytona answered, and the host did not reach the state asked for in time.
     TimedOut(String),
-    /// Daytona already has what was to be made: a sandbox by that name (HTTP 409).
+    /// Daytona already has what was to be made: a host by that name (HTTP 409).
     Conflict(String),
-    /// Anything else Daytona answered, or a sandbox that ended in a state it was not asked for.
+    /// Anything else Daytona answered, or a host that ended in a state it was not asked for.
     Failed(String),
 }
 
-/// A sandbox as Daytona answers it, as far as the adapter reads it.
+/// A host as Daytona answers it, as far as the adapter reads it.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Sandbox {
+pub struct Host {
     pub id: String,
     #[serde(default)]
     pub state: Option<String>,
@@ -53,7 +57,7 @@ pub struct Sandbox {
     pub toolbox_proxy_url: Option<String>,
 }
 
-impl Sandbox {
+impl Host {
     /// Its state, `unknown` where Daytona names none.
     pub fn state(&self) -> &str {
         self.state.as_deref().unwrap_or("unknown")
@@ -63,12 +67,12 @@ impl Sandbox {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Page {
-    items: Vec<Sandbox>,
+    items: Vec<Host>,
     #[serde(default)]
     next_cursor: Option<String>,
 }
 
-/// What a sandbox is made from, as `POST /sandbox` takes it.
+/// What a host is made from, as `POST /sandbox` takes it.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Create<'a> {
@@ -82,7 +86,7 @@ pub struct Create<'a> {
     pub target: Option<&'a str>,
 }
 
-/// An image to build a sandbox from: Daytona builds it from a Dockerfile.
+/// An image to build a host from: Daytona builds it from a Dockerfile.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildInfo {
@@ -98,7 +102,7 @@ impl BuildInfo {
     }
 }
 
-/// SSH access to a sandbox, as `POST /sandbox/{id}/ssh-access` answers it.
+/// SSH access to a host, as `POST /sandbox/{id}/ssh-access` answers it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshAccess {
@@ -195,13 +199,13 @@ impl Daytona {
         Ok(self.request(method, &format!("{}{path}", self.api), deadline.within()?))
     }
 
-    /// Every sandbox carrying all of `labels`, page by page. Daytona's listing is an index
+    /// Every host carrying all of `labels`, page by page. Daytona's listing is an index
     /// that may lag a change by a second or more.
     pub async fn list(
         &self,
         labels: &BTreeMap<String, String>,
         deadline: Deadline,
-    ) -> Result<Vec<Sandbox>, Fault> {
+    ) -> Result<Vec<Host>, Fault> {
         let labels = serde_json::to_string(labels).map_err(|e| Fault::Failed(e.to_string()))?;
         let limit = PAGE.to_string();
         let mut found = Vec::new();
@@ -227,11 +231,11 @@ impl Daytona {
         }
     }
 
-    pub async fn get(&self, id: &str, deadline: Deadline) -> Result<Sandbox, Fault> {
-        json(send(self.control(Method::GET, &sandbox_path(id, ""), deadline)?).await?).await
+    pub async fn get(&self, id: &str, deadline: Deadline) -> Result<Host, Fault> {
+        json(send(self.control(Method::GET, &host_path(id, ""), deadline)?).await?).await
     }
 
-    pub async fn create(&self, create: &Create<'_>, deadline: Deadline) -> Result<Sandbox, Fault> {
+    pub async fn create(&self, create: &Create<'_>, deadline: Deadline) -> Result<Host, Fault> {
         json(
             send(
                 self.control(Method::POST, "/sandbox", deadline)?
@@ -244,13 +248,13 @@ impl Daytona {
 
     /// `POST /sandbox/{id}/{action}`: `start`, `stop`, `archive`, `last-activity`.
     pub async fn act(&self, id: &str, action: &str, deadline: Deadline) -> Result<(), Fault> {
-        send(self.control(Method::POST, &sandbox_path(id, action), deadline)?)
+        send(self.control(Method::POST, &host_path(id, action), deadline)?)
             .await
             .map(drop)
     }
 
     pub async fn delete(&self, id: &str, deadline: Deadline) -> Result<(), Fault> {
-        send(self.control(Method::DELETE, &sandbox_path(id, ""), deadline)?)
+        send(self.control(Method::DELETE, &host_path(id, ""), deadline)?)
             .await
             .map(drop)
     }
@@ -262,15 +266,15 @@ impl Daytona {
         deadline: Deadline,
     ) -> Result<SshAccess, Fault> {
         let request = self
-            .control(Method::POST, &sandbox_path(id, "ssh-access"), deadline)?
+            .control(Method::POST, &host_path(id, "ssh-access"), deadline)?
             .query(&[("expiresInMinutes", minutes)]);
         json(send(request).await?).await
     }
 
     /// Polls `id` until it is in one of `targets`, every `every`. A state in `fails`, or
-    /// `destroyed` where it is not a target, fails; a sandbox Daytona no longer has is
+    /// `destroyed` where it is not a target, fails; a host Daytona no longer has is
     /// `destroyed`. A failed reading is read again until the deadline, as Daytona's own
-    /// clients do, but a refused key or a missing sandbox is final.
+    /// clients do, but a refused key or a missing host is final.
     pub async fn wait(
         &self,
         id: &str,
@@ -282,7 +286,7 @@ impl Daytona {
     ) -> Result<String, Fault> {
         loop {
             let reading = match self.get(id, deadline).await {
-                Ok(sandbox) => Ok(sandbox),
+                Ok(host) => Ok(host),
                 Err(Fault::NotFound(_)) if targets.contains(&"destroyed") => {
                     return Ok("destroyed".into());
                 }
@@ -290,15 +294,15 @@ impl Daytona {
                 Err(fault) => Err(fault),
             };
             let still = match reading {
-                Ok(sandbox) => {
-                    let state = sandbox.state();
+                Ok(host) => {
+                    let state = host.state();
                     if targets.contains(&state) {
                         return Ok(state.to_owned());
                     }
                     if fails.contains(&state) || state == "destroyed" {
-                        let reason = sandbox.error_reason.as_deref().unwrap_or("no reason given");
+                        let reason = host.error_reason.as_deref().unwrap_or("no reason given");
                         return Err(Fault::Failed(format!(
-                            "sandbox {id} failed to {what}: {state}: {reason}"
+                            "host {id} failed to {what}: {state}: {reason}"
                         )));
                     }
                     state.to_owned()
@@ -306,13 +310,13 @@ impl Daytona {
                 // The last reading's own fault: Daytona down to the end is offline.
                 Err(fault) if deadline.left().is_none() => return Err(fault),
                 Err(fault) => {
-                    eprintln!("daytona: reading sandbox {id} again: {fault:?}");
+                    eprintln!("daytona: reading host {id} again: {fault:?}");
                     "unread".to_owned()
                 }
             };
             let Some(left) = deadline.left() else {
                 return Err(Fault::TimedOut(format!(
-                    "sandbox {id} still {still} after {} s, not {what}",
+                    "host {id} still {still} after {} s, not {what}",
                     deadline.seconds()
                 )));
             };
@@ -320,14 +324,14 @@ impl Daytona {
         }
     }
 
-    /// The base of `sandbox`'s toolbox API.
-    pub fn toolbox(&self, sandbox: &Sandbox) -> Result<String, Fault> {
-        let proxy = sandbox
+    /// The base of `host`'s toolbox API.
+    pub fn toolbox(&self, host: &Host) -> Result<String, Fault> {
+        let proxy = host
             .toolbox_proxy_url
             .as_deref()
             .filter(|url| !url.is_empty())
-            .ok_or_else(|| Fault::Failed(format!("sandbox {} has no toolbox URL", sandbox.id)))?;
-        Ok(format!("{}/{}", proxy.trim_end_matches('/'), sandbox.id))
+            .ok_or_else(|| Fault::Failed(format!("host {} has no toolbox URL", host.id)))?;
+        Ok(format!("{}/{}", proxy.trim_end_matches('/'), host.id))
     }
 
     /// `POST /files/upload-v2`: `content` as the file `path`.
@@ -383,7 +387,8 @@ impl Daytona {
     }
 }
 
-fn sandbox_path(id: &str, action: &str) -> String {
+/// The control plane's path of host `id`, and of its `action` where one is named.
+fn host_path(id: &str, action: &str) -> String {
     let id: String = id
         .bytes()
         .map(|byte| match byte {

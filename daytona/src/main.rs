@@ -1,10 +1,11 @@
-//! Steery's `daytona` adapter. It provides `sandboxes` (PROTOCOL.md §3.2, §5.2) on
-//! Daytona, through Daytona's published REST API.
+//! Steery's `daytona` adapter. It provides `hosts` (PROTOCOL.md §3.2, §5.2) on
+//! Daytona, through Daytona's published REST API. Daytona's own words for a host (its API
+//! paths) stay inside [`api`], which names the items around them by Steery's.
 //!
 //! Its client is built from the settings `initialize` passes, and from nothing else: the
-//! sandbox, its image, credentials and network are the company's and Daytona's, so no
-//! sandbox is given an image, environment, secret or network setting of the adapter's own,
-//! and Daytona's auto-stop stays the sandbox's idle timer.
+//! host, its image, credentials and network are the company's and Daytona's, so no host is
+//! given an image, environment, secret or network setting of the adapter's own, and
+//! Daytona's auto-stop stays the host's idle timer.
 
 mod api;
 
@@ -17,14 +18,14 @@ use std::time::Duration;
 use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use steery_sdk::wire::{self, sandbox};
+use steery_sdk::wire::{self, hosts};
 use steery_sdk::{Error, PROTOCOL, Program, method, refusal};
 
 use api::{BuildInfo, Create, Daytona, Deadline, Fault};
 
-/// The label every sandbox this adapter makes carries, and every list is filtered by.
-const MINE: (&str, &str) = ("steery", "sandbox");
-/// The label that finds a sandbox again by the runtime's key.
+/// The label every host this adapter makes carries, and every list is filtered by.
+const MINE: (&str, &str) = ("steery", "host");
+/// The label that finds a host again by the runtime's key.
 const KEY_LABEL: &str = "steery-key";
 /// The host Daytona's SSH access docs name, where its answer names none.
 const SSH_HOST: &str = "ssh.app.daytona.io";
@@ -33,12 +34,12 @@ const SSH_MINUTES: u32 = 60;
 /// Seconds the adapter waits for Daytona, inside the runtime's bounds (§9: 300 s, 60 s).
 const LONG_SECONDS: u64 = 280;
 const CHANGE_SECONDS: u64 = 55;
-/// Seconds for one file call in the sandbox after an upload: a size check, a chmod, a removal.
+/// Seconds for one file call in the host after an upload: a size check, a chmod, a removal.
 const FILE_SECONDS: Duration = Duration::from_secs(5);
-/// How often a sandbox changing state is read again; an archive takes minutes.
+/// How often a host changing state is read again; an archive takes minutes.
 const POLL: Duration = Duration::from_secs(1);
 const ARCHIVE_POLL: Duration = Duration::from_secs(2);
-/// The states a sandbox that is being changed fails in.
+/// The states a host that is being changed fails in.
 const FAILED: &[&str] = &["error", "build_failed"];
 /// The longest line a refusal carries.
 const LINE_CHARS: usize = 300;
@@ -58,8 +59,8 @@ struct Adapter {
 
 /// Why no channel can be had here: Daytona's runs `ssh` on the controlling computer, and
 /// waiting does not install one. Said by `initialize` as `unavailable` (PROTOCOL.md §3.2),
-/// so the machine is never added where it cannot work, and by `sandbox/channel` and
-/// `sandboxes/list` as the guard where it is used.
+/// so the machine is never added where it cannot work, and by `hosts/channel` and
+/// `hosts/list` as the guard where it is used.
 const NO_SSH: &str = "Daytona's channel runs `ssh` on this computer, and none is installed: install an OpenSSH client (e.g. apt install openssh-client)";
 
 impl Adapter {
@@ -118,7 +119,7 @@ impl Program for Adapter {
                 mark: None,
             },
             harness: None,
-            machine: Some(wire::Machine::Sandboxes(wire::SandboxFacts {
+            machine: Some(wire::Machine::Hosts(wire::HostFacts {
                 keeps: wire::Survives::Filesystem,
                 persist: None,
                 idle: wire::Idle::Activity,
@@ -144,7 +145,7 @@ impl Program for Adapter {
                     "DAYTONA_TARGET",
                     false,
                     false,
-                    "The Daytona region sandboxes are made in (us, eu); absent: your organization's default",
+                    "The Daytona region hosts are made in (us, eu); absent: your organization's default",
                 ),
             ],
         })
@@ -161,18 +162,18 @@ impl Program for Adapter {
             })
         };
         match method {
-            method::SANDBOXES_LIST => {
+            method::HOSTS_LIST => {
                 self.reach()?;
                 result(list(daytona()?, given(params)?).await?)
             }
-            method::SANDBOX_ENSURE => result(ensure(daytona()?, given(params)?).await?),
-            method::SANDBOX_START => result(start(daytona()?, given(params)?).await?),
-            method::SANDBOX_STOP => result(stop(daytona()?, given(params)?).await?),
-            method::SANDBOX_DELETE => result(delete(daytona()?, given(params)?).await?),
-            method::SANDBOX_ARCHIVE => result(archive(daytona()?, given(params)?).await?),
-            method::SANDBOX_KEEPALIVE => result(keepalive(daytona()?, given(params)?).await?),
-            method::SANDBOX_PUT => result(put(daytona()?, given(params)?).await?),
-            method::SANDBOX_CHANNEL => {
+            method::HOSTS_ENSURE => result(ensure(daytona()?, given(params)?).await?),
+            method::HOSTS_START => result(start(daytona()?, given(params)?).await?),
+            method::HOSTS_STOP => result(stop(daytona()?, given(params)?).await?),
+            method::HOSTS_DELETE => result(delete(daytona()?, given(params)?).await?),
+            method::HOSTS_ARCHIVE => result(archive(daytona()?, given(params)?).await?),
+            method::HOSTS_KEEPALIVE => result(keepalive(daytona()?, given(params)?).await?),
+            method::HOSTS_PUT => result(put(daytona()?, given(params)?).await?),
+            method::HOSTS_CHANNEL => {
                 self.reach()?;
                 result(channel(daytona()?, given(params)?).await?)
             }
@@ -203,7 +204,7 @@ fn refuse(daytona: &Daytona, fault: Fault, otherwise: &'static str) -> Error {
             ),
         ),
         Fault::Offline(line) => (refusal::OFFLINE, format!("Daytona: {line}")),
-        // Daytona answered, and the sandbox was not there in time.
+        // Daytona answered, and the host was not there in time.
         Fault::TimedOut(line) => (refusal::REFUSED, format!("Daytona: {line} (timed out)")),
         Fault::Conflict(line) | Fault::Failed(line) => (otherwise, format!("Daytona: {line}")),
     };
@@ -220,10 +221,10 @@ fn one_line(key: &str, text: &str) -> String {
     }
 }
 
-/// A sandbox's id, never empty.
+/// A host's id, never empty.
 fn named(id: &str) -> Result<&str, Error> {
     if id.is_empty() {
-        Err(Error::invalid("sandbox must be a non-empty string"))
+        Err(Error::invalid("host must be a non-empty string"))
     } else {
         Ok(id)
     }
@@ -251,33 +252,33 @@ fn quote(arg: &str) -> String {
     }
 }
 
-async fn list(daytona: &Daytona, params: sandbox::List) -> Result<sandbox::Listed, Error> {
+async fn list(daytona: &Daytona, params: hosts::List) -> Result<hosts::Listed, Error> {
     let mut labels = params.labels.unwrap_or_default();
     labels.insert(MINE.0.into(), MINE.1.into());
     let found = daytona
         .list(&labels, Deadline::after(CHANGE_SECONDS))
         .await
         .map_err(|fault| refuse(daytona, fault, refusal::REFUSED))?;
-    let sandboxes = found
+    let hosts = found
         .into_iter()
-        .map(|sandbox| sandbox::Sandbox {
-            state: sandbox.state().to_owned(),
-            created_at: millis(sandbox.created_at.as_deref()),
-            labels: sandbox.labels.unwrap_or_default(),
-            sandbox: sandbox.id,
+        .map(|host| hosts::Host {
+            state: host.state().to_owned(),
+            created_at: millis(host.created_at.as_deref()),
+            labels: host.labels.unwrap_or_default(),
+            host: host.id,
         })
         .collect();
-    Ok(sandbox::Listed { sandboxes })
+    Ok(hosts::Listed { hosts })
 }
 
-/// The sandbox made for `key`, or one made for it now from the source asked, or from
+/// The host made for `key`, or one made for it now from the source asked, or from
 /// Daytona's default snapshot, and started.
 ///
 /// It is found by its name, which Daytona keeps unique and reads back at once; its listing
-/// lags a new sandbox by a second or more, so finding it by its labels would make a second
-/// one for an ensure sent again in that time. Two ensures for one key make one sandbox: the
+/// lags a new host by a second or more, so finding it by its labels would make a second
+/// one for an ensure sent again in that time. Two ensures for one key make one host: the
 /// later one's create is refused as a conflict and finds the other's.
-async fn ensure(daytona: &Daytona, params: sandbox::Ensure) -> Result<sandbox::Named, Error> {
+async fn ensure(daytona: &Daytona, params: hosts::Ensure) -> Result<hosts::Named, Error> {
     if params.key.is_empty() {
         return Err(Error::invalid("key must be a non-empty string"));
     }
@@ -287,8 +288,8 @@ async fn ensure(daytona: &Daytona, params: sandbox::Ensure) -> Result<sandbox::N
     labels.insert(MINE.0.to_owned(), MINE.1.to_owned());
     labels.insert(KEY_LABEL.to_owned(), params.key.clone());
     let (snapshot, build_info) = match &params.source {
-        Some(sandbox::Source::Snapshot(snapshot)) => (Some(snapshot.as_str()), None),
-        Some(sandbox::Source::Image(reference)) => (None, Some(BuildInfo::image(reference))),
+        Some(hosts::Source::Snapshot(snapshot)) => (Some(snapshot.as_str()), None),
+        Some(hosts::Source::Image(reference)) => (None, Some(BuildInfo::image(reference))),
         None => (None, None),
     };
     let create = Create {
@@ -303,10 +304,10 @@ async fn ensure(daytona: &Daytona, params: sandbox::Ensure) -> Result<sandbox::N
             match daytona.get(&name, deadline).await {
                 Ok(found) if !owned(&found, &params.key) => {
                     return Err(Fault::Failed(format!(
-                        "a sandbox named {name} is not the one Steery made for this key: its labels differ"
+                        "a host named {name} is not the one Steery made for this key: its labels differ"
                     )));
                 }
-                // A sandbox being deleted keeps its name until it is gone.
+                // A host being deleted keeps its name until it is gone.
                 Ok(found) if matches!(found.state(), "destroying" | "destroyed") => {}
                 Ok(found) => return Ok(found.id),
                 Err(Fault::NotFound(_)) => match daytona.create(&create, deadline).await {
@@ -325,19 +326,19 @@ async fn ensure(daytona: &Daytona, params: sandbox::Ensure) -> Result<sandbox::N
             }
             let Some(left) = deadline.left() else {
                 return Err(Fault::TimedOut(format!(
-                    "the sandbox named {name} was still being deleted after {LONG_SECONDS} s"
+                    "the host named {name} was still being deleted after {LONG_SECONDS} s"
                 )));
             };
             tokio::time::sleep(POLL.min(left)).await;
         }
     };
-    let sandbox = ensured
+    let host = ensured
         .await
         .map_err(|fault| refuse(daytona, fault, refusal::START_FAILED))?;
-    Ok(sandbox::Named { sandbox })
+    Ok(hosts::Named { host })
 }
 
-/// The name of the sandbox for `key`: `steery-` and the first 128 bits of its SHA-256, in
+/// The name of the host for `key`: `steery-` and the first 128 bits of its SHA-256, in
 /// hex, so any key makes a name Daytona takes.
 fn name_of(key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
@@ -348,16 +349,16 @@ fn name_of(key: &str) -> String {
     format!("steery-{hex}")
 }
 
-/// Whether `sandbox` carries this adapter's labels for `key`.
-fn owned(sandbox: &api::Sandbox, key: &str) -> bool {
-    sandbox.labels.as_ref().is_some_and(|labels| {
+/// Whether `host` carries this adapter's labels for `key`.
+fn owned(host: &api::Host, key: &str) -> bool {
+    host.labels.as_ref().is_some_and(|labels| {
         labels.get(MINE.0).map(String::as_str) == Some(MINE.1)
             && labels.get(KEY_LABEL).map(String::as_str) == Some(key)
     })
 }
 
-async fn start(daytona: &Daytona, params: sandbox::Target) -> Result<sandbox::State, Error> {
-    let id = named(&params.sandbox)?;
+async fn start(daytona: &Daytona, params: hosts::Target) -> Result<hosts::State, Error> {
+    let id = named(&params.host)?;
     let deadline = Deadline::after(LONG_SECONDS);
     let started = async {
         daytona.act(id, "start", deadline).await?;
@@ -368,18 +369,18 @@ async fn start(daytona: &Daytona, params: sandbox::Target) -> Result<sandbox::St
     let state = started
         .await
         .map_err(|fault| refuse(daytona, fault, refusal::START_FAILED))?;
-    Ok(sandbox::State { state })
+    Ok(hosts::State { state })
 }
 
-async fn stop(daytona: &Daytona, params: sandbox::Target) -> Result<sandbox::State, Error> {
-    let id = named(&params.sandbox)?;
+async fn stop(daytona: &Daytona, params: hosts::Target) -> Result<hosts::State, Error> {
+    let id = named(&params.host)?;
     let state = stopped(daytona, id, Deadline::after(CHANGE_SECONDS))
         .await
         .map_err(|fault| refuse(daytona, fault, refusal::REFUSED))?;
-    Ok(sandbox::State { state })
+    Ok(hosts::State { state })
 }
 
-/// Stops `id` and waits until it is stopped; an ephemeral sandbox may be destroyed instead.
+/// Stops `id` and waits until it is stopped; an ephemeral host may be destroyed instead.
 async fn stopped(daytona: &Daytona, id: &str, deadline: Deadline) -> Result<String, Fault> {
     daytona.act(id, "stop", deadline).await?;
     daytona
@@ -394,8 +395,8 @@ async fn stopped(daytona: &Daytona, id: &str, deadline: Deadline) -> Result<Stri
         .await
 }
 
-async fn delete(daytona: &Daytona, params: sandbox::Target) -> Result<sandbox::State, Error> {
-    let id = named(&params.sandbox)?;
+async fn delete(daytona: &Daytona, params: hosts::Target) -> Result<hosts::State, Error> {
+    let id = named(&params.host)?;
     let deadline = Deadline::after(CHANGE_SECONDS);
     let deleted = async {
         daytona.delete(id, deadline).await?;
@@ -406,13 +407,13 @@ async fn delete(daytona: &Daytona, params: sandbox::Target) -> Result<sandbox::S
     let state = deleted
         .await
         .map_err(|fault| refuse(daytona, fault, refusal::REFUSED))?;
-    Ok(sandbox::State { state })
+    Ok(hosts::State { state })
 }
 
-/// Archive: Daytona archives only a stopped sandbox, so a started one is stopped first, and
+/// Archive: Daytona archives only a stopped host, so a started one is stopped first, and
 /// moving its filesystem to object storage takes minutes.
-async fn archive(daytona: &Daytona, params: sandbox::Target) -> Result<sandbox::State, Error> {
-    let id = named(&params.sandbox)?;
+async fn archive(daytona: &Daytona, params: hosts::Target) -> Result<hosts::State, Error> {
+    let id = named(&params.host)?;
     let deadline = Deadline::after(LONG_SECONDS);
     let archived = async {
         let was = daytona.get(id, deadline).await?;
@@ -430,12 +431,12 @@ async fn archive(daytona: &Daytona, params: sandbox::Target) -> Result<sandbox::
     let state = archived
         .await
         .map_err(|fault| refuse(daytona, fault, refusal::REFUSED))?;
-    Ok(sandbox::State { state })
+    Ok(hosts::State { state })
 }
 
-/// Refreshes the sandbox's last activity, which Daytona's auto-stop counts from.
-async fn keepalive(daytona: &Daytona, params: sandbox::Target) -> Result<wire::Empty, Error> {
-    let id = named(&params.sandbox)?;
+/// Refreshes the host's last activity, which Daytona's auto-stop counts from.
+async fn keepalive(daytona: &Daytona, params: hosts::Target) -> Result<wire::Empty, Error> {
+    let id = named(&params.host)?;
     daytona
         .act(id, "last-activity", Deadline::after(CHANGE_SECONDS))
         .await
@@ -443,11 +444,11 @@ async fn keepalive(daytona: &Daytona, params: sandbox::Target) -> Result<wire::E
     Ok(wire::Empty {})
 }
 
-/// Uploads the file, proves its size on the sandbox, and sets its mode. An upload can answer
+/// Uploads the file, proves its size on the host, and sets its mode. An upload can answer
 /// before the file is whole, or time out half-written: a partial file is removed rather
 /// than left to be run.
-async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Error> {
-    let id = named(&params.sandbox)?;
+async fn put(daytona: &Daytona, params: hosts::Put) -> Result<wire::Empty, Error> {
+    let id = named(&params.host)?;
     let path = params
         .path
         .to_str()
@@ -463,8 +464,8 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
     let length = content.len() as u64;
     let deadline = Deadline::after(LONG_SECONDS);
     let fail = |fault| refuse(daytona, fault, refusal::REFUSED);
-    let sandbox = daytona.get(id, deadline).await.map_err(fail)?;
-    let toolbox = daytona.toolbox(&sandbox).map_err(fail)?;
+    let host = daytona.get(id, deadline).await.map_err(fail)?;
+    let toolbox = daytona.toolbox(&host).map_err(fail)?;
     let within = deadline
         .left()
         .ok_or_else(|| fail(Fault::TimedOut(format!("no time left for {path}"))))?;
@@ -495,7 +496,7 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
             one_line(
                 daytona.key(),
                 &format!(
-                    "Daytona: {why}: {path} had {written} of {length} bytes written; {removed} (fetch a large file from inside the sandbox)"
+                    "Daytona: {why}: {path} had {written} of {length} bytes written; {removed} (fetch a large file from inside the host)"
                 ),
             ),
         ));
@@ -508,9 +509,9 @@ async fn put(daytona: &Daytona, params: sandbox::Put) -> Result<wire::Empty, Err
 }
 
 /// An argv channel: `ssh -T` to Daytona's gateway with a 60-minute access token, running
-/// `command` in the sandbox.
-async fn channel(daytona: &Daytona, params: sandbox::Channel) -> Result<sandbox::Reach, Error> {
-    let id = named(&params.sandbox)?;
+/// `command` in the host.
+async fn channel(daytona: &Daytona, params: hosts::Channel) -> Result<hosts::Reach, Error> {
+    let id = named(&params.host)?;
     if params.command.is_empty() {
         return Err(Error::invalid(
             "command must be a non-empty array of strings",
@@ -536,7 +537,7 @@ async fn channel(daytona: &Daytona, params: sandbox::Channel) -> Result<sandbox:
             .collect::<Vec<_>>()
             .join(" "),
     );
-    Ok(sandbox::Reach::Argv {
+    Ok(hosts::Reach::Argv {
         argv,
         env: BTreeMap::new(),
     })
@@ -600,12 +601,12 @@ mod tests {
         );
     }
 
-    /// The refusal word and line `sandboxes/list` answers against a Daytona answering
+    /// The refusal word and line `hosts/list` answers against a Daytona answering
     /// `status` with `body`.
     async fn listed(status: u16, body: &'static str) -> (String, String) {
         let url = api::tests::daytona_answering(Some(status), body).await;
         let daytona = Daytona::new("sk-secret".into(), Some(&url), None).unwrap();
-        match list(&daytona, sandbox::List { labels: None }).await {
+        match list(&daytona, hosts::List { labels: None }).await {
             Err(Error::Refused { word, line }) => (word, line.unwrap_or_default()),
             other => panic!("{other:?}"),
         }
@@ -633,9 +634,9 @@ mod tests {
         }
     }
 
-    /// Without `ssh` on this computer no channel can be had, so `sandbox/channel` refuses
+    /// Without `ssh` on this computer no channel can be had, so `hosts/channel` refuses
     /// `refused`, saying what to install, before it asks Daytona anything; and so does
-    /// `sandboxes/list`, the first call `machine add` makes.
+    /// `hosts/list`, the first call adding a machine makes.
     #[tokio::test]
     async fn without_an_ssh_client_a_channel_is_refused_saying_what_to_install() {
         let without = Adapter {
@@ -646,9 +647,9 @@ mod tests {
             Err(Error::Refused { word, line }) => (word, line.unwrap_or_default()),
             other => panic!("{other:?}"),
         };
-        let asked = serde_json::json!({"sandbox": "s", "command": ["steery", "serve"]});
-        for method in [method::SANDBOX_CHANNEL, method::SANDBOXES_LIST] {
-            let params = if method == method::SANDBOXES_LIST {
+        let asked = serde_json::json!({"host": "s", "command": ["steery", "serve"]});
+        for method in [method::HOSTS_CHANNEL, method::HOSTS_LIST] {
+            let params = if method == method::HOSTS_LIST {
                 serde_json::json!({})
             } else {
                 asked.clone()
@@ -663,12 +664,12 @@ mod tests {
             daytona: OnceLock::from(None),
             ssh: OnceLock::from(true),
         };
-        let (_, line) = refused(with.call(method::SANDBOX_CHANNEL, asked).await);
+        let (_, line) = refused(with.call(method::HOSTS_CHANNEL, asked).await);
         assert!(line.contains("DAYTONA_API_KEY"), "{line}");
     }
 
-    /// `initialize` says up front that no sandbox can be had from a computer without
-    /// `ssh` (PROTOCOL.md §3.2), so `machine add` refuses before it writes anything.
+    /// `initialize` says up front that no host can be had from a computer without
+    /// `ssh` (PROTOCOL.md §3.2), so adding the machine refuses before it writes anything.
     #[test]
     fn without_an_ssh_client_initialize_says_daytona_is_unavailable_here() {
         let params: wire::InitializeParams = serde_json::from_value(serde_json::json!({
@@ -683,7 +684,7 @@ mod tests {
                 ssh: OnceLock::from(ssh),
             };
             match adapter.initialize(&params).unwrap().machine {
-                Some(wire::Machine::Sandboxes(facts)) => facts.unavailable,
+                Some(wire::Machine::Hosts(facts)) => facts.unavailable,
                 other => panic!("{other:?}"),
             }
         };

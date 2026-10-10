@@ -15,7 +15,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use serde::Deserialize;
 use serde_json::json;
 use steery_sdk::wire::Empty;
-use steery_sdk::wire::sandbox::{
+use steery_sdk::wire::hosts::{
     Channel, Reach, StreamClose, StreamClosed, StreamData, StreamWrite,
 };
 use steery_sdk::{Error, Notifier, method, refusal};
@@ -130,14 +130,14 @@ impl Channels {
             })
     }
 
-    /// `sandbox/channel`: open a PTY session running `command` and join it.
+    /// `hosts/channel`: open a PTY session running `command` and join it.
     pub async fn channel(
         self: &Arc<Self>,
         provider: Arc<Provider>,
         asked: Channel,
     ) -> Result<Reach, Error> {
-        if asked.sandbox.is_empty() {
-            return Err(Error::invalid("sandbox must be a non-empty string"));
+        if asked.host.is_empty() {
+            return Err(Error::invalid("host must be a non-empty string"));
         }
         if asked.command.is_empty() {
             return Err(Error::invalid(
@@ -151,7 +151,7 @@ impl Channels {
             .collect::<Vec<_>>()
             .join(" ");
         let execd = provider
-            .execd(&asked.sandbox)
+            .execd(&asked.host)
             .await
             .map_err(|fail| provider.refuse(fail, refusal::REFUSED))?;
         let session = provider

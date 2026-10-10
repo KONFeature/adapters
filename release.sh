@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds every adapter for the targets it runs on, packs them into a release
 # (PROTOCOL.md §7.1 in steery-dev/sdk) and, with --publish, publishes it on GitHub.
-# An operating system's adapter is built only for that system's targets; a sandbox
-# provider's adapter for every target.
+# An operating system's adapter is built only for that system's targets; an adapter
+# that makes hosts for every target.
 #
 #   ./release.sh <tag> [--publish] [--no-pack]
 #

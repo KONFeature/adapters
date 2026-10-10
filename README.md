@@ -1,14 +1,15 @@
 # Steery adapters
 
 An adapter connects [Steery](https://steery.dev) to one kind of machine: an operating system
-(`macos`, `linux`) or a sandbox provider (`daytona`, `opensandbox`). The Steery runtime
+(`macos`, `linux`) or a vendor's service that makes hosts (`daytona`, `opensandbox`): a
+machine whose adapter makes hosts runs each conversation in a host of its own. The Steery runtime
 starts an adapter as a child process and speaks the program protocol to it, JSON-RPC 2.0
 over standard input and output (`PROTOCOL.md` in
 [steery-dev/sdk](https://github.com/steery-dev/sdk)). Drivers, one
 per agent harness, live in `steery-dev/drivers`.
 
 Each adapter is its own program, `steery-adapter-<id>`, built on the `steery-sdk` crate,
-and answers version 2 of the program protocol. Steery adds the adapters below the way it
+and answers version 3 of the program protocol. Steery adds the adapters below the way it
 adds any program: from this repository's releases, each a prebuilt executable per target
 (`steery programs add https://github.com/steery-dev/adapters`, which Steery's installer
 runs). An operating-system adapter is built only for that system's targets, and the runtime
@@ -19,8 +20,8 @@ person sees of an adapter, its label, its short name, its tint and its mark, is 
 ```
 macos/       steery-adapter-macos: processes on macOS
 linux/       steery-adapter-linux: processes on Linux
-daytona/     steery-adapter-daytona: Daytona sandboxes
-opensandbox/ steery-adapter-opensandbox: OpenSandbox sandboxes
+daytona/     steery-adapter-daytona: hosts on Daytona
+opensandbox/ steery-adapter-opensandbox: hosts on OpenSandbox
 ```
 
 Each crate is a Cargo workspace of its own, with its own `Cargo.lock`, so it builds alone.
@@ -34,7 +35,7 @@ systemd or launchd — stays in its own adapter.
 
 The SDK and the protocol live in [steery-dev/sdk](https://github.com/steery-dev/sdk).
 Every crate names the SDK by git, at a tag,
-`steery-sdk = { git = "https://github.com/steery-dev/sdk", tag = "v2.0.0" }`, and pins its
+`steery-sdk = { git = "https://github.com/steery-dev/sdk", tag = "v3.0.0" }`, and pins its
 toolchain in `rust-toolchain.toml`:
 
 ```sh
@@ -84,14 +85,14 @@ worked example: one file, `src/main.rs`.
   `steery_sdk::PROTOCOL`, keeps the `home` it is given, and answers `wire::Initialized`:
   `program` (`id: "linux"`, `kind: Machine`, `release`, `label: "Linux"`, `short: "Lx"`,
   and optionally `tint` and `mark`), no `harness`,
-  `machine` (`wire::Machine::Processes` with `os: Linux` and `service: Systemd`; a sandbox
-  provider answers `Sandboxes` with what it keeps, how it idles, its optional methods and
-  its channel; PROTOCOL.md §3.2), and the settings it needs (none here; `daytona` and
+  `machine` (`wire::Machine::Processes` with `os: Linux` and `service: Systemd`; an adapter
+  that makes hosts answers `Hosts` with what it keeps, how it idles, its optional methods
+  and its channel; PROTOCOL.md §3.2), and the settings it needs (none here; `daytona` and
   `opensandbox` declare theirs, §3.4).
 - **The methods** (`Program::call`) are one match from each `steery_sdk::method` name to the
   function that answers it, its parameters read with `steery_sdk::params` and its answer
   given with `steery_sdk::result`: `process/*` and `service/*` for `processes` (§5.1),
-  `sandboxes/list` and `sandbox/*` for `sandboxes` (§5.2), `stream/*` for a `stream`
+  `hosts/*` for `hosts` (§5.2), `stream/*` for a `stream`
   channel (§5.3); any other answers `Error::Unknown`. A refusal is `Error::refused` with
   one of the protocol's words (`steery_sdk::refusal`).
 
@@ -116,7 +117,7 @@ Steery's programs folder, started and checked as `steery programs test` checks i
 settings given (`--setting NAME=VALUE`, or `--setting NAME` from the environment; a secret
 one not given is typed at the terminal, unechoed). Steery prints what it will add and asks
 once at the terminal; `--yes` is that answer anywhere else. Every build the release has for
-another target is kept beside the record, so a sandbox gets the Linux build it needs.
+another target is kept beside the record, so a host gets the Linux build it needs.
 
 `steery programs remove <id>` removes it.
 
@@ -181,40 +182,42 @@ method.
 
 ## daytona
 
-`daytona/` provides `sandboxes` on [Daytona](https://daytona.io) (`initialize` answers
-`machine: {provides: "sandboxes", keeps: "filesystem", idle: "activity", optional:
+`daytona/` provides `hosts` on [Daytona](https://daytona.io) (`initialize` answers
+`machine: {provides: "hosts", keeps: "filesystem", idle: "activity", optional:
 ["archive", "keepalive"], channel: "argv", os: "linux"}`). It calls Daytona's published
-REST API directly, over HTTPS (rustls): the control plane
-([`openapi.json`](https://www.daytona.io/docs/openapi.json)) and each sandbox's toolbox
-([`toolbox-openapi.json`](https://www.daytona.io/docs/toolbox-openapi.json)), through the
-toolbox proxy Daytona names for it. It passes no image, environment, secret or network
-setting of its own, and leaves Daytona's auto-stop as the sandbox's idle timer.
+REST API directly, over HTTPS (rustls): the control plane ([`openapi.json`](https://www.daytona.io/docs/openapi.json)) and each host's
+toolbox ([`toolbox-openapi.json`](https://www.daytona.io/docs/toolbox-openapi.json)),
+through the toolbox proxy Daytona names for it. Daytona's own words for a host (its API
+paths) stay inside `src/api.rs`, whose items are named by Steery's words (`api::Host` is a host as
+Daytona answers it). It passes no image, environment, secret or network setting of its own,
+and leaves Daytona's auto-stop as the host's idle timer.
 
-- `sandboxes/list`: the sandboxes labelled `steery=sandbox` and every label asked, page by
-  page. Daytona's listing lags a change by a second or more.
-- `sandbox/ensure`: the sandbox named `steery-<first 128 bits of the key's SHA-256, hex>`,
-  or one made under that name, labelled `steery=sandbox`, `steery-key=<key>` and the
-  labels asked, from the snapshot or image (built `FROM` it) the runtime names, or
-  Daytona's default snapshot, and waited for until it runs. Daytona keeps names unique and
-  reads them back at once, so an ensure sent twice, even at once, makes one sandbox. A
-  sandbox of that name without those labels is refused; one being deleted is waited out.
-- `sandbox/start`, `stop`, `delete` and `archive` ask Daytona and wait until the sandbox is
+- `hosts/list`: the hosts labelled `steery=host` and every label asked, page by page.
+  Daytona's listing lags a change by a second or more.
+- `hosts/ensure`: the host named `steery-<first 128 bits of the key's SHA-256, hex>`, or
+  one made under that name, labelled `steery=host`, `steery-key=<key>` and the labels
+  asked, from the snapshot or image (built `FROM` it) the runtime names, or Daytona's
+  default snapshot, and waited for until it runs. Daytona keeps names unique and reads them
+  back at once, so an ensure sent twice, even at once, makes one host. A host of that name
+  without those labels is refused; one being deleted is waited out.
+- `hosts/start`, `stop`, `delete` and `archive` ask Daytona and wait until the host is
   `started`, `stopped`, `destroyed` or `archived`, reading it again every second (every
-  two while archiving); `error` or `build_failed` fails. Archive stops a started sandbox
+  two while archiving); `error` or `build_failed` fails. Archive stops a started host
   first, since Daytona archives only a stopped one. Its filesystem survives a stop and an
   archive.
-- `sandbox/keepalive` refreshes the sandbox's last activity, which auto-stop counts from.
-- `sandbox/put` uploads the file (`/files/upload-v2`), reads its size back
+- `hosts/keepalive` refreshes the host's last activity, which auto-stop counts from.
+- `hosts/put` uploads the file (`/files/upload-v2`), reads its size back
   (`/files/info`) and sets its mode (`/files/permissions`). A file that timed out or came
   out short is deleted and the put refused; a large file is better fetched from inside.
-- `sandbox/channel` is an `argv` channel: `ssh -T` to Daytona's SSH gateway
+- `hosts/channel` is an `argv` channel: `ssh -T` to Daytona's SSH gateway
   (`ssh.app.daytona.io`, or the host and port Daytona's answer names) with a 60-minute
-  access token, running the runtime's command, quoted for the sandbox's shell.
+  access token, running the runtime's command, quoted for the host's shell.
 
 The channel runs `ssh` on the controlling computer, which carries the command's standard
 input and output byte for byte, so an OpenSSH client there is a prerequisite (`apt install
-openssh-client` on a bare Debian or Ubuntu). Where none is on `PATH`, `sandbox/channel` and
-`sandboxes/list` — the first call `steery machine add` makes, so nothing is written — refuse
+openssh-client` on a bare Debian or Ubuntu). Where none is on `PATH`, `initialize` says so
+as `unavailable`, so no machine is added where it cannot work, and `hosts/channel` and
+`hosts/list` — the first call adding a machine makes, so nothing is written — refuse
 `refused`: "Daytona's channel runs `ssh` on this computer, and none is installed: install an
 OpenSSH client (e.g. apt install openssh-client)".
 
@@ -225,17 +228,18 @@ reached, a gateway answering for it (HTTP 502, 503, 504), or a request with no a
 its time — a retry the server bounds; `refused` for a refused API key (HTTP 401, 403),
 whose line names the setting to give again (`Daytona refused the API key (HTTP 401: …):
 give DAYTONA_API_KEY again`), since a bad key does not heal by waiting; `start-failed` (a
-sandbox that could not be made or started); or `refused`, which is also a sandbox that
-did not reach the state asked for in time, and a put whose upload got no answer by its
-bound. Each line is Daytona's own message, without the API key.
+host that could not be made or started); or `refused`, which is also a host that did not
+reach the state asked for in time, and a put whose upload got no answer by its bound. Each
+line is Daytona's own message, without the API key.
 
-Its settings, given once when it is added (`steery programs add … --setting NAME`):
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter daytona --setting NAME[=VALUE]` on a computer):
 
 | Setting | | |
 |---|---|---|
 | `DAYTONA_API_KEY` | secret, required | an API key from <https://app.daytona.io/dashboard/keys> |
 | `DAYTONA_API_URL` | optional | your Daytona API URL, for a self-hosted Daytona; absent: `https://app.daytona.io/api` |
-| `DAYTONA_TARGET` | optional | the region sandboxes are made in; absent: your organization's default |
+| `DAYTONA_TARGET` | optional | the region hosts are made in; absent: your organization's default |
 
 It reads them from `initialize` only, never from its environment or a file. Build and
 check it:
@@ -245,43 +249,45 @@ cd daytona && cargo build && cargo clippy && cargo test
 DAYTONA_API_KEY=… steery programs test target/debug/steery-adapter-daytona --setting DAYTONA_API_KEY
 ```
 
-With the key, the check also lists your sandboxes (`sandboxes/list`); it makes none.
+With the key, the check also lists your hosts (`hosts/list`); it makes none.
 
 ## opensandbox
 
-`opensandbox/` provides `sandboxes` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
-(`initialize` answers `machine: {provides: "sandboxes", keeps: "filesystem", idle: "ttl",
+`opensandbox/` provides `hosts` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
+(`initialize` answers `machine: {provides: "hosts", keeps: "filesystem", idle: "ttl",
 optional: ["pause", "keepalive"], channel: "stream", os: "linux"}`). It is a Rust binary,
 `steery-adapter-opensandbox`, speaking the program protocol through `steery-sdk`, and talks
-to OpenSandbox's published lifecycle API and to the execd daemon in each sandbox over HTTP
-and WebSocket (rustls), with no provider SDK:
+to OpenSandbox's published lifecycle API and to the execd daemon in each host over HTTP and
+WebSocket (rustls), with no vendor SDK. OpenSandbox's own words for a host (its API paths,
+its key header) stay inside `src/provider.rs`, whose items are named by Steery's words
+(`provider::Found` is a host as the API answers it):
 
-- `sandboxes/list`: the sandboxes whose metadata holds `steery=sandbox` and every label asked.
-- `sandbox/ensure`: finds the sandbox whose metadata holds `steery-key=<key>`, or makes one
+- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked.
+- `hosts/ensure`: finds the host whose metadata holds `steery-key=<key>`, or makes one
   from the image (`image.uri`) or snapshot (`snapshotId`) the runtime names. OpenSandbox
-  has no default image, so with neither it refuses `no-place`. A sandbox made from an image
+  has no default image, so with neither it refuses `no-place`. A host made from an image
   is given the entrypoint `tail -f /dev/null`, because the API requires one; its resource
   limits are left empty, so the server's own apply. Metadata keys and values follow
   Kubernetes label rules (63 characters; letters, digits, `-`, `_`, `.`), so a key or label
-  outside them is refused by the server. OpenSandbox takes no name to make a sandbox by and
+  outside them is refused by the server. OpenSandbox takes no name to make a host by and
   has nothing to lock on, so ensures for one key run one after the other in the adapter,
-  and after making one it lists the key again: the oldest sandbox, by the creation time the
+  and after making one it lists the key again: the oldest host, by the creation time the
   listing reads, is the key's, and a younger one it made is deleted. Two adapters making one
-  at once thus answer one sandbox, as long as the server lists each before the other's
+  at once thus answer one host, as long as the server lists each before the other's
   create answers (a create still pulling its image is not listed).
-- `sandbox/start` resumes a paused sandbox and waits until it runs; `stop` and `pause`
+- `hosts/start` resumes a paused host and waits until it runs; `stop` and `pause`
   pause it (OpenSandbox's only stop that keeps it); `delete` deletes it. Its filesystem
   survives a pause.
-- `sandbox/keepalive` renews the expiration by the TTL the server gave it when it was made
-  (kept in its metadata as `steery-ttl`), or by an hour; a sandbox with no expiration needs
-  none. The adapter sets no timeout of its own, so the server's default is the sandbox's
-  idle timer; on the Docker runtime that default is none, and a sandbox lives until it is
+- `hosts/keepalive` renews the expiration by the TTL the server gave it when it was made
+  (kept in its metadata as `steery-ttl`), or by an hour; a host with no expiration needs
+  none. The adapter sets no timeout of its own, so the server's default is the host's
+  idle timer; on the Docker runtime that default is none, and a host lives until it is
   deleted.
-- `sandbox/put` uploads the file through execd (`/files/upload`) with its mode, then reads
+- `hosts/put` uploads the file through execd (`/files/upload`) with its mode, then reads
   its size back (`/files/info`); a file that is not whole is removed before it refuses.
-- `sandbox/channel` is a `stream` channel: it opens a pipe-mode PTY session in execd running
+- `hosts/channel` is a `stream` channel: it opens a pipe-mode PTY session in execd running
   the command (`POST /pty`) and joins its WebSocket (`/pty/{id}/ws?pty=0`), reached through
-  the sandbox's endpoint for port 44772 and the headers that endpoint names.
+  the host's endpoint for port 44772 and the headers that endpoint names.
   `stream/write` sends standard-input frames; standard output comes back as `stream/data`,
   standard error goes to the adapter's log, and `stream/closed` carries the exit code (none
   for a command a signal ended).
@@ -291,9 +297,10 @@ and WebSocket (rustls), with no provider SDK:
 Errors read as `not-found` (HTTP 404); `offline` where OpenSandbox is down — not reached,
 a gateway answering for it (HTTP 502, 503, 504), or no answer in time; `refused` for a
 refused API key (HTTP 401, 403), whose line names `OPENSANDBOX_API_KEY` to give (again);
-`start-failed` (a sandbox that could not be made or resumed); or `refused`.
+`start-failed` (a host that could not be made or resumed); or `refused`.
 
-Its settings, given once when it is added (`steery programs add … --setting NAME`):
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter opensandbox --setting NAME[=VALUE]` on a computer):
 
 | Setting | | |
 |---|---|---|
@@ -308,32 +315,32 @@ steery programs test target/debug/steery-adapter-opensandbox \
   --setting OPENSANDBOX_URL=http://localhost:8080 --setting OPENSANDBOX_API_KEY
 ```
 
-The check lists sandboxes on the server it is given; a local server is the
-`opensandbox/server` image (`opensandbox/server:release-1.1.0`, which runs sandboxes with
+The check lists hosts on the server it is given; a local server is the
+`opensandbox/server` image (`opensandbox/server:release-1.1.0`, which runs hosts with
 `opensandbox/execd:v1.1.0`) with the Docker runtime, as its
 `server/docker-compose.example.yaml` sets it up. On a Mac, set the server's `host_ip` to
 `127.0.0.1` rather than the example's `host.docker.internal`: the endpoints the server
 hands out must be reachable from the Mac itself, where the adapter runs, and
 `host.docker.internal` resolves only inside containers.
 
-## What Steery adds to a sandbox
+## What Steery adds to a host
 
-A sandbox machine (`steery machine add daytona`) adds to each sandbox it uses:
+A machine whose adapter makes hosts (a cloud machine added on Steery's web, or a computer
+set up with `steery setup --adapter daytona`) adds to each host it uses:
 
-- the `steery` binary, which `steery sandbox serve` runs inside, and the Linux build of each
-  program added on the computer, from its release, for the sandbox's target;
+- the `steery` binary, which `steery host serve` runs inside, and the Linux build of each
+  program added on the computer, from its release, for the host's target;
 - the harness's MCP entry, skill and hooks, as on a laptop.
 
-It adds nothing else. The sandbox is yours: your snapshot, your Daytona settings, your
+It adds nothing else. The host is yours: your snapshot, your Daytona settings, your
 harness, set up the way you already set them up.
 
-A new machine makes one sandbox of its own as soon as it runs, so it learns which
-harnesses your image has and offers them. That sandbox is stopped when idle like any
-other, and the first conversation started there takes it. Each later conversation gets a
-sandbox of its own.
+A new machine makes one host of its own as soon as it runs, so it learns which harnesses
+your image has and offers them. That host is stopped when idle like any other, and the
+first conversation started there takes it. Each later conversation gets a host of its own.
 
-Where `steery` is missing in a sandbox, Steery installs it over the channel the first
-time. To have it there already, add the one line to your image. In a Dockerfile:
+Where `steery` is missing in a host, Steery installs it over the channel the first time.
+To have it there already, add the one line to your image. In a Dockerfile:
 
 ```dockerfile
 RUN curl -fsSL https://steery.dev/install.sh | sh -s -- --install-only --to /usr/local/bin

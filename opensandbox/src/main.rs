@@ -1,9 +1,9 @@
-//! Steery's adapter for OpenSandbox: it provides sandboxes (PROTOCOL.md §3.2, §5.2, §5.3).
+//! Steery's adapter for OpenSandbox: it provides hosts (PROTOCOL.md §3.2, §5.2, §5.3).
 //!
 //! The runtime starts it and speaks the program protocol on standard input and output. It
-//! talks to OpenSandbox's lifecycle API and to the execd daemon inside each sandbox over
-//! their published HTTP and WebSocket APIs. The sandbox, its image, credentials and network
-//! are the company's and OpenSandbox's: a sandbox is given no image, environment, secret or
+//! talks to OpenSandbox's lifecycle API and to the execd daemon inside each host over
+//! their published HTTP and WebSocket APIs. The host, its image, credentials and network
+//! are the company's and OpenSandbox's: a host is given no image, environment, secret or
 //! network setting of the adapter's own.
 
 mod channel;
@@ -18,29 +18,29 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
-use steery_sdk::wire::sandbox::{self, Ensure, Named, Put, Source, State};
+use steery_sdk::wire::hosts::{self, Ensure, Named, Put, Source, State};
 use steery_sdk::wire::{self, Empty};
 use steery_sdk::{Error, PROTOCOL, Program, method, params as given, refusal, result};
 
 use crate::channel::Channels;
 use crate::provider::{Fail, Found, Provider};
 
-/// The metadata every sandbox this adapter makes carries, and every list is filtered by.
-const MINE: (&str, &str) = ("steery", "sandbox");
-/// The metadata that finds a sandbox again by the runtime's key.
+/// The metadata every host this adapter makes carries, and every list is filtered by.
+const MINE: (&str, &str) = ("steery", "host");
+/// The metadata that finds a host again by the runtime's key.
 const KEY_LABEL: &str = "steery-key";
-/// The metadata that keeps the TTL a sandbox was made with, in seconds, for keepalive.
+/// The metadata that keeps the TTL a host was made with, in seconds, for keepalive.
 const TTL_LABEL: &str = "steery-ttl";
-/// The TTL keepalive renews by where a sandbox kept none.
+/// The TTL keepalive renews by where a host kept none.
 const DEFAULT_TTL_SECONDS: i64 = 3600;
-/// OpenSandbox requires an entrypoint with an image; this one only keeps the sandbox up.
+/// OpenSandbox requires an entrypoint with an image; this one only keeps the host up.
 const IDLE_ENTRYPOINT: [&str; 3] = ["tail", "-f", "/dev/null"];
-/// How long a sandbox may take to make, resume or pause, inside the runtime's bounds
+/// How long a host may take to make, resume or pause, inside the runtime's bounds
 /// (PROTOCOL.md §9: 300 s, 60 s).
 const MAKE_WAIT: Duration = Duration::from_secs(280);
 const CHANGE_WAIT: Duration = Duration::from_secs(55);
 const POLL: Duration = Duration::from_secs(1);
-/// The states a sandbox found by key is never reused from.
+/// The states a host found by key is never reused from.
 const GONE: [&str; 2] = ["Stopping", "Terminated"];
 
 #[tokio::main(flavor = "current_thread")]
@@ -69,7 +69,7 @@ struct OpenSandbox {
     keys: Keys,
 }
 
-/// One lock per key a `sandbox/ensure` runs for: two ensures for one key in this process
+/// One lock per key a `hosts/ensure` runs for: two ensures for one key in this process
 /// run one after the other, so the second finds what the first made.
 #[derive(Default)]
 struct Keys(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
@@ -127,7 +127,7 @@ impl Program for OpenSandbox {
                 mark: None,
             },
             harness: None,
-            machine: Some(wire::Machine::Sandboxes(wire::SandboxFacts {
+            machine: Some(wire::Machine::Hosts(wire::HostFacts {
                 keeps: wire::Survives::Filesystem,
                 persist: None,
                 idle: wire::Idle::Ttl,
@@ -157,8 +157,8 @@ impl Program for OpenSandbox {
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         match method {
-            method::SANDBOXES_LIST => result(list(&*self.provider()?, given(params)?).await?),
-            method::SANDBOX_ENSURE => {
+            method::HOSTS_LIST => result(list(&*self.provider()?, given(params)?).await?),
+            method::HOSTS_ENSURE => {
                 let asked: Ensure = given(params)?;
                 let provider = self.provider()?;
                 let key = asked.key.clone();
@@ -170,16 +170,16 @@ impl Program for OpenSandbox {
                 self.keys.release(&key, lock);
                 result(answer?)
             }
-            method::SANDBOX_START => result(start(&*self.provider()?, given(params)?).await?),
-            method::SANDBOX_STOP | method::SANDBOX_PAUSE => {
+            method::HOSTS_START => result(start(&*self.provider()?, given(params)?).await?),
+            method::HOSTS_STOP | method::HOSTS_PAUSE => {
                 result(pause(&*self.provider()?, given(params)?).await?)
             }
-            method::SANDBOX_DELETE => result(delete(&*self.provider()?, given(params)?).await?),
-            method::SANDBOX_KEEPALIVE => {
+            method::HOSTS_DELETE => result(delete(&*self.provider()?, given(params)?).await?),
+            method::HOSTS_KEEPALIVE => {
                 result(keepalive(&*self.provider()?, given(params)?).await?)
             }
-            method::SANDBOX_PUT => result(put(&*self.provider()?, given(params)?).await?),
-            method::SANDBOX_CHANNEL => {
+            method::HOSTS_PUT => result(put(&*self.provider()?, given(params)?).await?),
+            method::HOSTS_CHANNEL => {
                 let asked = given(params)?;
                 result(self.channels.channel(self.provider()?, asked).await?)
             }
@@ -206,7 +206,7 @@ fn millis(at: &str) -> Option<i64> {
         .map(|at| at.timestamp_millis())
 }
 
-/// Read the sandbox until its state is one of `want`, or until `wait` has passed.
+/// Read the host until its state is one of `want`, or until `wait` has passed.
 async fn until(
     provider: &Provider,
     id: &str,
@@ -230,38 +230,38 @@ async fn until(
                 .unwrap_or_default();
             return Err(Fail::Refused(
                 refusal::START_FAILED,
-                format!("sandbox {id} is {state}{said}"),
+                format!("host {id} is {state}{said}"),
             ));
         }
         if Instant::now() >= deadline {
             return Err(Fail::Refused(
                 refusal::START_FAILED,
-                format!("sandbox {id} is still {state}, not {}", want.join(" or ")),
+                format!("host {id} is still {state}, not {}", want.join(" or ")),
             ));
         }
         tokio::time::sleep(POLL).await;
     }
 }
 
-async fn list(provider: &Provider, asked: sandbox::List) -> Result<sandbox::Listed, Error> {
+async fn list(provider: &Provider, asked: hosts::List) -> Result<hosts::Listed, Error> {
     let mut labels = asked.labels.unwrap_or_default();
     labels.insert(MINE.0.into(), MINE.1.into());
     let found = provider
         .listed(&labels)
         .await
         .map_err(|fail| provider.refuse(fail, refusal::REFUSED))?;
-    let sandboxes = found
+    let hosts = found
         .into_iter()
-        .map(|found| sandbox::Sandbox {
+        .map(|found| hosts::Host {
             created_at: millis(&found.created_at)
                 .and_then(|at| u64::try_from(at).ok())
                 .unwrap_or(0),
-            sandbox: found.id,
+            host: found.id,
             state: found.status.state,
             labels: found.metadata.unwrap_or_default(),
         })
         .collect();
-    Ok(sandbox::Listed { sandboxes })
+    Ok(hosts::Listed { hosts })
 }
 
 async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
@@ -276,7 +276,7 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
         .map_err(|fail| provider.refuse(fail, refusal::REFUSED))?;
     if let Some(found) = oldest(listed.iter()) {
         return Ok(Named {
-            sandbox: found.id.clone(),
+            host: found.id.clone(),
         });
     }
     let mut metadata = asked.labels;
@@ -297,7 +297,7 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
         None => {
             return Err(Error::refused(
                 refusal::NO_PLACE,
-                "OpenSandbox needs an image or a snapshot to make a sandbox: it has no default. Name one as the machine's source.",
+                "OpenSandbox needs an image or a snapshot to make a host: it has no default. Name one as the machine's source.",
             ));
         }
     };
@@ -305,9 +305,9 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
         .create(&body)
         .await
         .map_err(|fail| provider.refuse(fail, refusal::START_FAILED))?;
-    // OpenSandbox takes no name to make a sandbox by and has nothing to lock on, so an
+    // OpenSandbox takes no name to make a host by and has nothing to lock on, so an
     // ensure for the same key in another process may have made one at the same time: the
-    // oldest of them is the key's sandbox, and a younger one made here is deleted.
+    // oldest of them is the key's host, and a younger one made here is deleted.
     let others = match provider.listed(&mine).await {
         Ok(listed) => listed,
         Err(fail) => {
@@ -324,7 +324,7 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
         if let Err(fail) = provider.delete(&made.id).await {
             eprintln!("{}", provider.line(fail.said()));
         }
-        return Ok(Named { sandbox: kept });
+        return Ok(Named { host: kept });
     }
     // The server gave it a TTL: keep it, so keepalive renews by the same.
     let ttl = made
@@ -340,10 +340,10 @@ async fn ensure(provider: &Provider, asked: Ensure) -> Result<Named, Error> {
             eprintln!("{}", provider.line(fail.said()));
         }
     }
-    Ok(Named { sandbox: made.id })
+    Ok(Named { host: made.id })
 }
 
-/// The oldest sandbox that is not going away; of two made at once, the one whose id sorts
+/// The oldest host that is not going away; of two made at once, the one whose id sorts
 /// first.
 fn oldest<'a>(found: impl Iterator<Item = &'a Found>) -> Option<&'a Found> {
     found
@@ -352,7 +352,7 @@ fn oldest<'a>(found: impl Iterator<Item = &'a Found>) -> Option<&'a Found> {
 }
 
 async fn start(provider: &Provider, asked: Named) -> Result<State, Error> {
-    let id = named(&asked.sandbox, "sandbox")?;
+    let id = named(&asked.host, "host")?;
     let started = async {
         let mut found = provider.get(id).await?;
         if found.status.state == "Pausing" {
@@ -377,9 +377,9 @@ async fn start(provider: &Provider, asked: Named) -> Result<State, Error> {
         .map_err(|fail| provider.refuse(fail, refusal::START_FAILED))
 }
 
-/// Pause: OpenSandbox's only stop that keeps the sandbox.
+/// Pause: OpenSandbox's only stop that keeps the host.
 async fn pause(provider: &Provider, asked: Named) -> Result<State, Error> {
-    let id = named(&asked.sandbox, "sandbox")?;
+    let id = named(&asked.host, "host")?;
     let paused = async {
         let mut found = provider.get(id).await?;
         if matches!(found.status.state.as_str(), "Pending" | "Resuming") {
@@ -405,7 +405,7 @@ async fn pause(provider: &Provider, asked: Named) -> Result<State, Error> {
 }
 
 async fn delete(provider: &Provider, asked: Named) -> Result<State, Error> {
-    let id = named(&asked.sandbox, "sandbox")?;
+    let id = named(&asked.host, "host")?;
     let deleted = async {
         provider.delete(id).await?;
         match provider.get(id).await {
@@ -423,9 +423,9 @@ async fn delete(provider: &Provider, asked: Named) -> Result<State, Error> {
         .map_err(|fail| provider.refuse(fail, refusal::REFUSED))
 }
 
-/// Renew the sandbox's expiration by the TTL it was made with; one with none never expires.
+/// Renew the host's expiration by the TTL it was made with; one with none never expires.
 async fn keepalive(provider: &Provider, asked: Named) -> Result<Empty, Error> {
-    let id = named(&asked.sandbox, "sandbox")?;
+    let id = named(&asked.host, "host")?;
     let kept = async {
         let found = provider.get(id).await?;
         if found.expires_at.is_none() {
@@ -450,7 +450,7 @@ async fn keepalive(provider: &Provider, asked: Named) -> Result<Empty, Error> {
 /// Write the file through execd, check that every byte is there, and remove what is not
 /// whole before refusing (PROTOCOL.md §5.2).
 async fn put(provider: &Provider, asked: Put) -> Result<Empty, Error> {
-    let id = named(&asked.sandbox, "sandbox")?;
+    let id = named(&asked.host, "host")?;
     let path = asked
         .path
         .to_str()
