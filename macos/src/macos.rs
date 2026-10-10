@@ -412,7 +412,7 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
     let commands = vec![
         launchctl(&["bootout", &target], true),
         launchctl(&["enable", &target], false),
-        bootstrap_after_stop(&path),
+        bootstrap_after_stop(&path, &target),
     ];
     Ok(process::Plan {
         files: vec![process::PlannedFile {
@@ -427,10 +427,17 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
 /// The `launchctl bootstrap` of `path` into this user's GUI domain, tried again once a
 /// second while launchd still answers that the job is busy stopping, for the stop grace
 /// and [`BOOTSTRAP_SLACK_SECS`] more; any other failure, or the last one, is the plan's.
-fn bootstrap_after_stop(path: &Path) -> process::PlanCommand {
+///
+/// launchd answers the same error 5 for a job already loaded, and something else may load
+/// it while this waits: Steery.app's watchdog starts the runtime when its door stays shut.
+/// A failure is so a success when `launchctl print` finds the job loaded and not being
+/// stopped: the old job, still stopping, reads `state = SIGTERMed` (or `SIGKILLed`).
+fn bootstrap_after_stop(path: &Path, target: &str) -> process::PlanCommand {
     let tries = STOP_GRACE_SECS + BOOTSTRAP_SLACK_SECS;
     let script = format!(
         "i=0; while :; do out=$(launchctl bootstrap \"$1\" \"$2\" 2>&1) && exit 0; \
+         case \"$(launchctl print \"$3\" 2>/dev/null)\" in \
+         *\"state = SIG\"*) ;; *\"state = \"*) exit 0;; esac; \
          i=$((i+1)); case \"$out\" in *\"Bootstrap failed: 5:\"*) [ $i -lt {tries} ] && \
          {{ sleep 1; continue; }};; esac; printf '%s\\n' \"$out\" >&2; exit 1; done"
     );
@@ -442,6 +449,7 @@ fn bootstrap_after_stop(path: &Path) -> process::PlanCommand {
             "steery-bootstrap".to_owned(),
             domain(),
             path.to_string_lossy().into_owned(),
+            target.to_owned(),
         ],
         may_fail: false,
     }
@@ -866,5 +874,91 @@ fn same(pid: u32, process_start: u64) -> Result<(), Error> {
             refusal::NOT_FOUND,
             format!("pid {pid} is gone"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service replaced while it runs, as a runtime replaces its own after an update, is
+    /// loaded again once the plan's commands are run in order: `bootout` returns while the
+    /// old job is still stopping, and a `bootstrap` then fails and leaves none loaded. A
+    /// plan run while something else loads the job in that window (Steery.app's watchdog)
+    /// succeeds too: the job is up. Run against this user's own launchd, with a label of
+    /// its own.
+    #[test]
+    fn a_running_service_replaced_by_its_plan_is_loaded_again() {
+        let home = std::env::temp_dir().join(format!("steery-launchd-{}", std::process::id()));
+        let label = format!("dev.steery.test.replace{}", std::process::id());
+        let plan = service_plan(
+            &home,
+            process::ServicePlan {
+                label: label.clone(),
+                binary: PathBuf::from("/bin/sh"),
+                // It takes three seconds to stop once launchd asks it to.
+                args: vec![
+                    "-c".to_owned(),
+                    "trap 'sleep 3; exit 0' TERM; while :; do sleep 1; done".to_owned(),
+                ],
+                env: BTreeMap::new(),
+                port: 55990,
+                cpu: 50,
+                log: home.join("run.log"),
+            },
+        )
+        .unwrap();
+        let launchctl = |args: &[&str]| {
+            std::process::Command::new("launchctl")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let path = plist(&home, &label);
+        // Each command in order, as the runtime runs a plan; `meanwhile` runs once the
+        // old job was asked to stop, before the load.
+        let apply = |meanwhile: &dyn Fn()| {
+            for file in &plan.files {
+                std::fs::create_dir_all(file.path.parent().unwrap()).unwrap();
+                std::fs::write(&file.path, &file.content).unwrap();
+            }
+            for (at, command) in plan.commands.iter().enumerate() {
+                if at == plan.commands.len() - 1 {
+                    meanwhile();
+                }
+                let ran = std::process::Command::new(&command.argv[0])
+                    .args(&command.argv[1..])
+                    .output()
+                    .unwrap();
+                assert!(
+                    ran.status.success() || command.may_fail,
+                    "{:?}: {}",
+                    &command.argv[..2],
+                    String::from_utf8_lossy(&ran.stderr)
+                );
+            }
+        };
+        let loaded = || launchctl(&["print", &target(&label)]).status.success();
+        let result = std::panic::catch_unwind(|| {
+            apply(&|| {});
+            std::thread::sleep(Duration::from_secs(1));
+            assert!(loaded(), "installed");
+            apply(&|| {});
+            std::thread::sleep(Duration::from_secs(4));
+            assert!(loaded(), "replaced while it ran, it is loaded again");
+            // Something else loads it while the plan waits for the old job to stop.
+            apply(&|| {
+                while loaded() {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                launchctl(&["bootstrap", &domain(), &path.to_string_lossy()]);
+            });
+            assert!(loaded(), "loaded by another, the plan still succeeds");
+        });
+        launchctl(&["bootout", &target(&label)]);
+        let _ = std::fs::remove_dir_all(&home);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
