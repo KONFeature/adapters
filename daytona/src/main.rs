@@ -1,4 +1,4 @@
-//! Steery's official `daytona` adapter. It provides `sandboxes` (PROTOCOL.md §3.2, §5.2) on
+//! Steery's `daytona` adapter. It provides `sandboxes` (PROTOCOL.md §3.2, §5.2) on
 //! Daytona, through Daytona's published REST API.
 //!
 //! Its client is built from the settings `initialize` passes, and from nothing else: the

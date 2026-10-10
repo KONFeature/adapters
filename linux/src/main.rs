@@ -1,4 +1,4 @@
-//! Steery's official `linux` adapter. It provides `processes`: it starts, finds, inspects
+//! Steery's `linux` adapter. It provides `processes`: it starts, finds, inspects
 //! and signals processes on the computer it runs on, and keeps the runtime running there
 //! as a systemd user service. It reads processes from `/proc` and asks systemd through
 //! `systemctl --user`.

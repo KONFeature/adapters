@@ -1,4 +1,4 @@
-//! Steery's official `macos` adapter. It provides `processes`: it starts, finds, inspects
+//! Steery's `macos` adapter. It provides `processes`: it starts, finds, inspects
 //! and signals processes on the Mac it runs on, and keeps the runtime running there as a
 //! launchd agent. It reads processes through libproc and `sysctl`.
 //!
