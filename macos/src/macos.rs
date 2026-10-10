@@ -331,9 +331,10 @@ pub async fn listening(listening: process::Listening) -> Result<process::Listene
 /// it running, handed its listener by launchd on 127.0.0.1:`port`, at a lower priority
 /// (macOS bounds a user's CPU no other way, so `cpu` is checked and has nothing to set),
 /// its output appended to `log`. It keeps every directory of the `PATH` the plist on
-/// disk gave it. The commands unload the job an earlier plist loaded, which fails where
-/// none is and may, enable it, which an earlier `launchctl disable` would otherwise keep
-/// from loading, and load it in this user's GUI domain. `bootout` returns while the old
+/// disk gave it. The commands unload the job an earlier plist loaded, only where launchd
+/// has one, so a first install says no `No such process`; enable it, which an earlier
+/// `launchctl disable` would otherwise keep from loading; and load it in this user's GUI
+/// domain. `bootout` returns while the old
 /// job is still stopping (up to its `ExitTimeOut`), and a `bootstrap` then fails with
 /// launchd's error 5 until it has gone: an update that replaced the plist was left with no
 /// runtime at all (2026-10-09, 6.12.0). So the load is tried again each second until the
@@ -410,7 +411,7 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
         may_fail,
     };
     let commands = vec![
-        launchctl(&["bootout", &target], true),
+        bootout_where_loaded(&target),
         launchctl(&["enable", &target], false),
         bootstrap_after_stop(&path, &target),
     ];
@@ -422,6 +423,24 @@ pub fn service_plan(home: &Path, plan: process::ServicePlan) -> Result<process::
         }],
         commands,
     })
+}
+
+/// The `launchctl bootout` of `target` where launchd has it loaded, and nothing where it
+/// has none: a first install, or a service a person's Quit already let go. Its own failure
+/// is said and does not stop the plan, as before; only the one that is no failure, a job
+/// not there to unload, is no longer said.
+fn bootout_where_loaded(target: &str) -> process::PlanCommand {
+    process::PlanCommand {
+        argv: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "launchctl print \"$1\" >/dev/null 2>&1 || exit 0; exec launchctl bootout \"$1\""
+                .to_owned(),
+            "steery-bootout".to_owned(),
+            target.to_owned(),
+        ],
+        may_fail: true,
+    }
 }
 
 /// The `launchctl bootstrap` of `path` into this user's GUI domain, tried again once a
@@ -885,8 +904,9 @@ mod tests {
     /// loaded again once the plan's commands are run in order: `bootout` returns while the
     /// old job is still stopping, and a `bootstrap` then fails and leaves none loaded. A
     /// plan run while something else loads the job in that window (Steery.app's watchdog)
-    /// succeeds too: the job is up. Run against this user's own launchd, with a label of
-    /// its own.
+    /// succeeds too: the job is up. The first install, with nothing loaded to unload, runs
+    /// every command cleanly: a person adding a machine is shown no `No such process`.
+    /// Run against this user's own launchd, with a label of its own.
     #[test]
     fn a_running_service_replaced_by_its_plan_is_loaded_again() {
         let home = std::env::temp_dir().join(format!("steery-launchd-{}", std::process::id()));
@@ -916,12 +936,13 @@ mod tests {
         };
         let path = plist(&home, &label);
         // Each command in order, as the runtime runs a plan; `meanwhile` runs once the
-        // old job was asked to stop, before the load.
-        let apply = |meanwhile: &dyn Fn()| {
+        // old job was asked to stop, before the load. Says whether every command succeeded.
+        let apply = |meanwhile: &dyn Fn()| -> bool {
             for file in &plan.files {
                 std::fs::create_dir_all(file.path.parent().unwrap()).unwrap();
                 std::fs::write(&file.path, &file.content).unwrap();
             }
+            let mut clean = true;
             for (at, command) in plan.commands.iter().enumerate() {
                 if at == plan.commands.len() - 1 {
                     meanwhile();
@@ -936,11 +957,13 @@ mod tests {
                     &command.argv[..2],
                     String::from_utf8_lossy(&ran.stderr)
                 );
+                clean &= ran.status.success();
             }
+            clean
         };
         let loaded = || launchctl(&["print", &target(&label)]).status.success();
         let result = std::panic::catch_unwind(|| {
-            apply(&|| {});
+            assert!(apply(&|| {}), "a first install runs every command cleanly");
             std::thread::sleep(Duration::from_secs(1));
             assert!(loaded(), "installed");
             apply(&|| {});

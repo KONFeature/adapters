@@ -325,7 +325,10 @@ steery adapter test target/debug/steery-adapter-opensandbox \
 The check lists sandboxes on the server it is given; a local server is the
 `opensandbox/server` image (`opensandbox/server:release-1.1.0`, which runs sandboxes with
 `opensandbox/execd:v1.1.0`) with the Docker runtime, as its
-`server/docker-compose.example.yaml` sets it up.
+`server/docker-compose.example.yaml` sets it up. On a Mac, set the server's `host_ip` to
+`127.0.0.1` rather than the example's `host.docker.internal`: the endpoints the server
+hands out must be reachable from the Mac itself, where the adapter runs, and
+`host.docker.internal` resolves only inside containers.
 
 ## What Steery adds to a sandbox
 
@@ -336,6 +339,11 @@ A sandbox machine (`steery machine add daytona`) adds to each sandbox it uses:
 
 It adds nothing else. The sandbox is yours: your snapshot, your Daytona settings, your
 harness, set up the way you already set them up.
+
+A new machine makes one sandbox of its own as soon as it runs, so it learns which
+harnesses your image has and offers them. That sandbox is stopped when idle like any
+other, and the first conversation started there takes it. Each later conversation gets a
+sandbox of its own.
 
 Where `steery` is missing in a sandbox, Steery installs it over the channel the first
 time. To have it there already, add the one line to your image. In a Dockerfile:
