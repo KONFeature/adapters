@@ -54,7 +54,9 @@ impl Program for Linux {
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "Linux".into(),
-                short: None,
+                short: "Lx".into(),
+                tint: None,
+                mark: None,
             },
             harness: None,
             machine: Some(wire::Machine::Processes(wire::ProcessFacts {

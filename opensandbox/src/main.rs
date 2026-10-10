@@ -122,7 +122,9 @@ impl Program for OpenSandbox {
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "OpenSandbox".into(),
-                short: None,
+                short: "OS".into(),
+                tint: None,
+                mark: None,
             },
             harness: None,
             machine: Some(wire::Machine::Sandboxes(wire::SandboxFacts {

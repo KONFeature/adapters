@@ -113,7 +113,9 @@ impl Program for Adapter {
                 kind: wire::Kind::Machine,
                 release: env!("CARGO_PKG_VERSION").into(),
                 label: "Daytona".into(),
-                short: None,
+                short: "Dt".into(),
+                tint: None,
+                mark: None,
             },
             harness: None,
             machine: Some(wire::Machine::Sandboxes(wire::SandboxFacts {

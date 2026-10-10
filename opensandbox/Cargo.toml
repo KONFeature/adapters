@@ -6,9 +6,9 @@ license = "MIT"
 description = "Steery's adapter for OpenSandbox: it makes, starts, pauses and deletes sandboxes, writes files into them and carries a stream to a command inside one."
 
 [dependencies]
-steery-sdk = { path = "../../server/crates/steery-sdk" }
+steery-sdk = { git = "https://github.com/steery-dev/sdk", tag = "v2.0.0" }
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["now", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

@@ -3,10 +3,10 @@ name = "steery-adapter-daytona"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Steery's official adapter for Daytona: it makes, starts, stops and reaches Daytona sandboxes through Daytona's REST API."
+description = "Steery's adapter for Daytona: it makes, starts, stops and reaches Daytona sandboxes through Daytona's REST API."
 
 [dependencies]
-steery-sdk = { path = "../../server/crates/steery-sdk" }
+steery-sdk = { git = "https://github.com/steery-dev/sdk", tag = "v2.0.0" }
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "http2"] }
 serde = { version = "1", features = ["derive"] }
