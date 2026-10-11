@@ -25,7 +25,7 @@ pub enum Fault {
     NotFound(String),
     /// Atelier refused the API key (HTTP 401), and what it said: a key that does not heal
     /// by waiting, given again by the person.
-    KeyRefused { status: u16, said: String },
+    KeyRefused { said: String },
     /// Atelier knows the key and denies this user the host or the action (HTTP 403), and
     /// what it said. The key is not at fault.
     Forbidden(String),
@@ -351,8 +351,7 @@ impl Atelier {
     }
 
     /// The id of the host a job makes, as soon as the job names it: Atelier picks it before
-    /// the job runs, and the host can be read at once, `creating`. A job already failed or
-    /// canceled is a fault.
+    /// the job runs. A job failed or canceled is a fault.
     pub fn started(job: &Job) -> Result<String, Fault> {
         let host = job.host()?;
         match job.status.as_str() {
@@ -369,19 +368,11 @@ impl Atelier {
 
     /// Reads job `id` until it is done; the host it made once it succeeded.
     pub async fn finish(&self, job: Job, deadline: Deadline) -> Result<String, Fault> {
-        let host = job.host()?;
         let mut job = job;
         loop {
-            match job.status.as_str() {
-                "succeeded" => return Ok(host),
-                "failed" | "canceled" => {
-                    let why = job.error.as_deref().unwrap_or("no reason given");
-                    return Err(Fault::Failed(format!(
-                        "making host {host} {}: {why}",
-                        job.status
-                    )));
-                }
-                _ => {}
+            let host = Self::started(&job)?;
+            if job.status == "succeeded" {
+                return Ok(host);
             }
             let Some(left) = deadline.left() else {
                 return Err(Fault::TimedOut(format!(
@@ -462,7 +453,9 @@ async fn send(request: RequestBuilder) -> Result<Response, Fault> {
         return Ok(response);
     }
     let body = response.text().await.unwrap_or_default();
-    let message = said(&body).unwrap_or_else(|| {
+    let json = said(&body);
+    let from_json = json.is_some();
+    let message = json.unwrap_or_else(|| {
         let reason = status.canonical_reason().unwrap_or("error");
         if body.trim().is_empty() {
             reason.to_owned()
@@ -470,19 +463,22 @@ async fn send(request: RequestBuilder) -> Result<Response, Fault> {
             body
         }
     });
-    Err(fault(status, message))
+    Err(fault(status, message, from_json))
 }
 
 /// The fault an answer outside 2xx is, `message` being what Atelier said.
-fn fault(status: StatusCode, message: String) -> Fault {
+/// A 404 is a missing route only where Atelier's own JSON body (`json`) says so: a proxy's
+/// 404 is not evidence of one.
+fn fault(status: StatusCode, message: String, json: bool) -> Fault {
     let line = format!("{message} (HTTP {})", status.as_u16());
     match status {
-        StatusCode::NOT_FOUND if message == "Endpoint not found" => Fault::NoRoute(line),
+        StatusCode::NOT_FOUND
+            if json && message.trim().eq_ignore_ascii_case("Endpoint not found") =>
+        {
+            Fault::NoRoute(line)
+        }
         StatusCode::NOT_FOUND => Fault::NotFound(line),
-        StatusCode::UNAUTHORIZED => Fault::KeyRefused {
-            status: 401,
-            said: message,
-        },
+        StatusCode::UNAUTHORIZED => Fault::KeyRefused { said: message },
         StatusCode::FORBIDDEN => Fault::Forbidden(line),
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
             Fault::Offline(line)
@@ -621,7 +617,7 @@ pub mod tests {
     async fn a_refused_key_and_other_answers_read_as_their_faults() {
         let fault = fault_of(Some(401)).await;
         assert!(
-            matches!(&fault, Fault::KeyRefused { status: 401, said } if said == "said"),
+            matches!(&fault, Fault::KeyRefused { said } if said == "said"),
             "{fault:?}"
         );
         let fault = fault_of(Some(403)).await;
@@ -645,6 +641,21 @@ pub mod tests {
         let atelier = Atelier::new(&url, "atl_x".into()).unwrap();
         let fault = atelier.get("s", Deadline::after(1)).await.unwrap_err();
         assert!(matches!(&fault, Fault::NoRoute(_)), "{fault:?}");
+        let url = atelier_answering(|_| {
+            Some((
+                404,
+                r#"{"error":"NOT_FOUND","message":" endpoint NOT found "}"#.to_owned(),
+            ))
+        })
+        .await;
+        let atelier = Atelier::new(&url, "atl_x".into()).unwrap();
+        let fault = atelier.get("s", Deadline::after(1)).await.unwrap_err();
+        assert!(matches!(&fault, Fault::NoRoute(_)), "{fault:?}");
+        // A proxy's plain 404 is no evidence of a missing route.
+        let url = atelier_answering(|_| Some((404, "Endpoint not found".to_owned()))).await;
+        let atelier = Atelier::new(&url, "atl_x".into()).unwrap();
+        let fault = atelier.get("s", Deadline::after(1)).await.unwrap_err();
+        assert!(matches!(&fault, Fault::NotFound(_)), "{fault:?}");
     }
 
     #[test]

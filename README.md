@@ -339,6 +339,455 @@ a host (its API paths) stay inside `src/api.rs`, whose items are named by Steery
 network setting of its own: a host gets what Atelier gives every host of its user and
 organization.
 
+- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked
+  (`GET /v1/sandboxes?metadata=…&owner=me`). The adapter drops any host lacking a label
+  asked, so a server that ignores the filters never gets `list` or `ensure` an unrelated
+  host; only `owner=me` (an Atelier that has it) restricts the list to the key user's own
+  hosts. An older Atelier ignores `owner` harmlessly.
+- `hosts/ensure`: the host named `steery-<first 128 bits of the key's SHA-256, hex>`, or
+  one made under that name, labelled `steery=host`, `steery-key=<key>` and the labels
+  asked, from the snapshot or image (built `FROM` it) the runtime names, or Daytona's
+  default snapshot, with the environment `DAYTONA_ENV` names (Daytona's `env`, sent only
+  when given), and waited for until it runs. Daytona keeps names unique and reads them
+  back at once, so an ensure sent twice, even at once, makes one host. A host of that name
+  without those labels is refused; one being deleted is waited out.
+- `hosts/start`, `stop`, `delete` and `archive` ask Daytona and wait until the host is
+  `started`, `stopped`, `destroyed` or `archived`, reading it again every second (every
+  two while archiving); `error` or `build_failed` fails. Archive stops a started host
+  first, since Daytona archives only a stopped one. Its filesystem survives a stop and an
+  archive.
+- `hosts/keepalive` refreshes the host's last activity, which auto-stop counts from.
+- `hosts/put` uploads the file (`/files/upload-v2`), reads its size back
+  (`/files/info`) and sets its mode (`/files/permissions`). A file that timed out or came
+  out short is deleted and the put refused; a large file is better fetched from inside.
+- `hosts/channel` is an `argv` channel: `ssh -T` to Daytona's SSH gateway
+  (`ssh.app.daytona.io`, or the host and port Daytona's answer names) with a 60-minute
+  access token, running the runtime's command, quoted for the host's shell.
+
+The channel runs `ssh` on the controlling computer, which carries the command's standard
+input and output byte for byte, so an OpenSSH client there is a prerequisite (`apt install
+openssh-client` on a bare Debian or Ubuntu). Where none is on `PATH`, `initialize` says so
+as `unavailable`, so no machine is added where it cannot work, and `hosts/channel` and
+`hosts/list` — the first call adding a machine makes, so nothing is written — refuse
+`refused`: "Daytona's channel runs `ssh` on this computer, and none is installed: install an
+OpenSSH client (e.g. apt install openssh-client)".
+
+It waits for Daytona inside the runtime's bounds: 280 s for `ensure`, `start`, `archive`
+and `put` (bound 300 s), 55 s for the rest (bound 60 s), and 5 s for each file call after
+an upload. Errors read as `not-found` (HTTP 404); `offline` where Daytona is down — not
+reached, a gateway answering for it (HTTP 502, 503, 504), or a request with no answer in
+its time — a retry the server bounds; `refused` for a refused API key (HTTP 401, 403),
+whose line names the setting to give again (`Daytona refused the API key (HTTP 401: …):
+give DAYTONA_API_KEY again`), since a bad key does not heal by waiting; `start-failed` (a
+host that could not be made or started); or `refused`, which is also a host that did not
+reach the state asked for in time, and a put whose upload got no answer by its bound. Each
+line is Daytona's own message, without the API key.
+
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter daytona --setting NAME[=VALUE]` on a computer):
+
+| Setting | | |
+|---|---|---|
+| `DAYTONA_API_KEY` | secret, required | an API key from <https://app.daytona.io/dashboard/keys> |
+| `DAYTONA_API_URL` | optional | your Daytona API URL, for a self-hosted Daytona; absent: `https://app.daytona.io/api` |
+| `DAYTONA_TARGET` | optional | the region hosts are made in; absent: your organization's default |
+| `DAYTONA_ENV` | secret, optional | environment set on every host it makes, one `NAME=VALUE` per line (blank and `#` lines skipped; the value is everything after the first `=`), passed to Daytona as it is; a malformed line refuses `initialize` naming its line number, never its value |
+
+It reads them from `initialize` only, never from its environment or a file. Build and
+check it:
+
+```sh
+cd daytona && cargo build && cargo clippy && cargo test
+DAYTONA_API_KEY=… steery programs test target/debug/steery-adapter-daytona --setting DAYTONA_API_KEY
+```
+
+With the key, the check also lists your hosts (`hosts/list`); it makes none.
+
+## opensandbox
+
+`opensandbox/` provides `hosts` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
+(`initialize` answers `machine: {provides: "hosts", keeps: "filesystem", idle: "ttl",
+optional: ["pause", "keepalive"], channel: "stream", os: "linux"}`). It is a Rust binary,
+`steery-adapter-opensandbox`, speaking the program protocol through `steery-sdk`, and talks
+to OpenSandbox's published lifecycle API and to the execd daemon in each host over HTTP and
+WebSocket (rustls), with no vendor SDK. OpenSandbox's own words for a host (its API paths,
+its key header) stay inside `src/provider.rs`, whose items are named by Steery's words
+(`provider::Found` is a host as the API answers it):
+
+- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked.
+- `hosts/ensure`: finds the host whose metadata holds `steery-key=<key>`, or makes one
+  from the image (`image.uri`) or snapshot (`snapshotId`) the runtime names. OpenSandbox
+  has no default image, so with neither it refuses `no-place`. A host made from an image
+  is given the entrypoint `tail -f /dev/null`, because the API requires one; its resource
+  limits are left empty, so the server's own apply. Metadata keys and values follow
+  Kubernetes label rules (63 characters; letters, digits, `-`, `_`, `.`), so a key or label
+  outside them is refused by the server. OpenSandbox takes no name to make a host by and
+  has nothing to lock on, so ensures for one key run one after the other in the adapter,
+  and after making one it lists the key again: the oldest host, by the creation time the
+  listing reads, is the key's, and a younger one it made is deleted. Two adapters making one
+  at once thus answer one host, as long as the server lists each before the other's
+  create answers (a create still pulling its image is not listed).
+- `hosts/start` resumes a paused host and waits until it runs; `stop` and `pause`
+  pause it (OpenSandbox's only stop that keeps it); `delete` deletes it. Its filesystem
+  survives a pause.
+- `hosts/keepalive` renews the expiration by the TTL the server gave it when it was made
+  (kept in its metadata as `steery-ttl`), or by an hour; a host with no expiration needs
+  none. The adapter sets no timeout of its own, so the server's default is the host's
+  idle timer; on the Docker runtime that default is none, and a host lives until it is
+  deleted.
+- `hosts/put` uploads the file through execd (`/files/upload`) with its mode, then reads
+  its size back (`/files/info`); a file that is not whole is removed before it refuses.
+- `hosts/channel` is a `stream` channel: it opens a pipe-mode PTY session in execd running
+  the command (`POST /pty`) and joins its WebSocket (`/pty/{id}/ws?pty=0`), reached through
+  the host's endpoint for port 44772 and the headers that endpoint names.
+  `stream/write` sends standard-input frames; standard output comes back as `stream/data`,
+  standard error goes to the adapter's log, and `stream/closed` carries the exit code (none
+  for a command a signal ended).
+  execd has no frame that closes only standard input, so `stream/close` sends the command
+  SIGHUP, ends the session after two seconds if it still runs, and closes the socket.
+
+Errors read as `not-found` (HTTP 404); `offline` where OpenSandbox is down — not reached,
+a gateway answering for it (HTTP 502, 503, 504), or no answer in time; `refused` for a
+refused API key (HTTP 401, 403), whose line names `OPENSANDBOX_API_KEY` to give (again);
+`start-failed` (a host that could not be made or resumed); or `refused`.
+
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter opensandbox --setting NAME[=VALUE]` on a computer):
+
+| Setting | | |
+|---|---|---|
+| `OPENSANDBOX_URL` | required | your OpenSandbox server, as its SDKs take it: `http://localhost:8080` |
+| `OPENSANDBOX_API_KEY` | secret, optional | the server's `server.api_key`, where it has one |
+
+It reads them from `initialize` only, never from its environment. Build and check it:
+
+```sh
+cd opensandbox && cargo build && cargo clippy && cargo test
+steery programs test target/debug/steery-adapter-opensandbox \
+  --setting OPENSANDBOX_URL=http://localhost:8080 --setting OPENSANDBOX_API_KEY
+```
+
+The check lists hosts on the server it is given; a local server is the
+`opensandbox/server` image (`opensandbox/server:release-1.1.0`, which runs hosts with
+`opensandbox/execd:v1.1.0`) with the Docker runtime, as its
+`server/docker-compose.example.yaml` sets it up. On a Mac, set the server's `host_ip` to
+`127.0.0.1` rather than the example's `host.docker.internal`: the endpoints the server
+hands out must be reachable from the Mac itself, where the adapter runs, and
+`host.docker.internal` resolves only inside containers.
+
+## atelier
+
+`atelier/` provides `hosts` on [Atelier](https://github.com/frak-id/atelier) (`initialize`
+answers `machine: {provides: "hosts", keeps: "filesystem", idle: "none", optional:
+["pause", "fork"], channel: "argv", os: "linux"}`). It calls Atelier's REST API directly,
+over HTTPS (rustls), as the user its API key is: `/v1` for hosts and the jobs a long change
+runs as, `/api` for that user's SSH keys and the server's settings. Atelier's own words for
+a host (its API paths) stay inside `src/api.rs`, whose items are named by Steery's words
+(`api::Host` is a host as Atelier lists it). It passes no toolbox, environment, secret or
+network setting of its own: a host gets what Atelier gives every host of its user and
+organization.
+
+- `hosts/list`: the key user's own hosts whose metadata holds `steery=host` and every
+  label asked (`GET /v1/sandboxes?metadata=…&owner=me`). Hosts that lack a label are
+  dropped by the adapter too, so an Atelier that ignores the filters (an older one) never
+  lists, or ensures, an unrelated host.
+- `hosts/ensure`: the oldest host whose metadata holds `steery-key=<key>`, or one made
+  (`POST /v1/sandboxes`) with the labels asked, `steery=host` and `steery-key=<key>` as its
+  metadata, from the snapshot or image the runtime names, or the server's
+  `sandbox.defaultImage`; its job is read (`GET /v1/jobs/:id`) until it is done and the
+  host until it is `running`. Atelier takes no name to make a host by, so ensures for one
+  key run one after the other in the adapter, and after making one it lists the key again:
+  the oldest host is the key's, and a younger one it made is deleted.
+- `hosts/start` resumes a paused host (`POST …/resume`) and waits until it runs; `stop`
+  and `pause` pause a running one (`POST …/pause`, Atelier's only stop that keeps it: a
+  snapshot of its filesystem); `delete` deletes it.
+- `hosts/fork` makes a new host from a snapshot of the host, with its spec and its labels
+  but its key and every `atelier.dev/` one (`POST …/fork`). It waits for the copy's job and
+  for it to run, within `fork`'s 60 s. Snapshot and boot may take minutes: where the time
+  runs out, it answers the copy's id if Atelier has the copy (`creating`), and
+  `hosts/start` waits for it to run. Where Atelier does not have it yet (an older one
+  registers the copy only after its snapshot), it refuses `refused`, timed out, rather than
+  answer an id that is `not-found`. A failed or canceled job, or a copy in error, refuses
+  `start-failed`. The runtime should call `hosts/start` on a forked host before using it;
+  PROTOCOL.md does not say it does, a gap to raise with Steery.
+- `hosts/put` uploads the file (`/files/upload-v2`), reads its size back
+  (`/files/info`) and sets its mode (`/files/permissions`). A file that timed out or came
+  out short is deleted and the put refused; a large file is better fetched from inside.
+- `hosts/channel` is an `argv` channel: `ssh -T` to Daytona's SSH gateway
+  (`ssh.app.daytona.io`, or the host and port Daytona's answer names) with a 60-minute
+  access token, running the runtime's command, quoted for the host's shell.
+
+The channel runs `ssh` on the controlling computer, which carries the command's standard
+input and output byte for byte, so an OpenSSH client there is a prerequisite (`apt install
+openssh-client` on a bare Debian or Ubuntu). Where none is on `PATH`, `initialize` says so
+as `unavailable`, so no machine is added where it cannot work, and `hosts/channel` and
+`hosts/list` — the first call adding a machine makes, so nothing is written — refuse
+`refused`: "Daytona's channel runs `ssh` on this computer, and none is installed: install an
+OpenSSH client (e.g. apt install openssh-client)".
+
+It waits for Daytona inside the runtime's bounds: 280 s for `ensure`, `start`, `archive`
+and `put` (bound 300 s), 55 s for the rest (bound 60 s), and 5 s for each file call after
+an upload. Errors read as `not-found` (HTTP 404); `offline` where Daytona is down — not
+reached, a gateway answering for it (HTTP 502, 503, 504), or a request with no answer in
+its time — a retry the server bounds; `refused` for a refused API key (HTTP 401, 403),
+whose line names the setting to give again (`Daytona refused the API key (HTTP 401: …):
+give DAYTONA_API_KEY again`), since a bad key does not heal by waiting; `start-failed` (a
+host that could not be made or started); or `refused`, which is also a host that did not
+reach the state asked for in time, and a put whose upload got no answer by its bound. Each
+line is Daytona's own message, without the API key.
+
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter daytona --setting NAME[=VALUE]` on a computer):
+
+| Setting | | |
+|---|---|---|
+| `DAYTONA_API_KEY` | secret, required | an API key from <https://app.daytona.io/dashboard/keys> |
+| `DAYTONA_API_URL` | optional | your Daytona API URL, for a self-hosted Daytona; absent: `https://app.daytona.io/api` |
+| `DAYTONA_TARGET` | optional | the region hosts are made in; absent: your organization's default |
+| `DAYTONA_ENV` | secret, optional | environment set on every host it makes, one `NAME=VALUE` per line (blank and `#` lines skipped; the value is everything after the first `=`), passed to Daytona as it is; a malformed line refuses `initialize` naming its line number, never its value |
+
+It reads them from `initialize` only, never from its environment or a file. Build and
+check it:
+
+```sh
+cd daytona && cargo build && cargo clippy && cargo test
+DAYTONA_API_KEY=… steery programs test target/debug/steery-adapter-daytona --setting DAYTONA_API_KEY
+```
+
+With the key, the check also lists your hosts (`hosts/list`); it makes none.
+
+## opensandbox
+
+`opensandbox/` provides `hosts` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
+(`initialize` answers `machine: {provides: "hosts", keeps: "filesystem", idle: "ttl",
+optional: ["pause", "keepalive"], channel: "stream", os: "linux"}`). It is a Rust binary,
+`steery-adapter-opensandbox`, speaking the program protocol through `steery-sdk`, and talks
+to OpenSandbox's published lifecycle API and to the execd daemon in each host over HTTP and
+WebSocket (rustls), with no vendor SDK. OpenSandbox's own words for a host (its API paths,
+its key header) stay inside `src/provider.rs`, whose items are named by Steery's words
+(`provider::Found` is a host as the API answers it):
+
+- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked.
+- `hosts/ensure`: finds the host whose metadata holds `steery-key=<key>`, or makes one
+  from the image (`image.uri`) or snapshot (`snapshotId`) the runtime names. OpenSandbox
+  has no default image, so with neither it refuses `no-place`. A host made from an image
+  is given the entrypoint `tail -f /dev/null`, because the API requires one; its resource
+  limits are left empty, so the server's own apply. Metadata keys and values follow
+  Kubernetes label rules (63 characters; letters, digits, `-`, `_`, `.`), so a key or label
+  outside them is refused by the server. OpenSandbox takes no name to make a host by and
+  has nothing to lock on, so ensures for one key run one after the other in the adapter,
+  and after making one it lists the key again: the oldest host, by the creation time the
+  listing reads, is the key's, and a younger one it made is deleted. Two adapters making one
+  at once thus answer one host, as long as the server lists each before the other's
+  create answers (a create still pulling its image is not listed).
+- `hosts/start` resumes a paused host and waits until it runs; `stop` and `pause`
+  pause it (OpenSandbox's only stop that keeps it); `delete` deletes it. Its filesystem
+  survives a pause.
+- `hosts/keepalive` renews the expiration by the TTL the server gave it when it was made
+  (kept in its metadata as `steery-ttl`), or by an hour; a host with no expiration needs
+  none. The adapter sets no timeout of its own, so the server's default is the host's
+  idle timer; on the Docker runtime that default is none, and a host lives until it is
+  deleted.
+- `hosts/put` uploads the file through execd (`/files/upload`) with its mode, then reads
+  its size back (`/files/info`); a file that is not whole is removed before it refuses.
+- `hosts/channel` is a `stream` channel: it opens a pipe-mode PTY session in execd running
+  the command (`POST /pty`) and joins its WebSocket (`/pty/{id}/ws?pty=0`), reached through
+  the host's endpoint for port 44772 and the headers that endpoint names.
+  `stream/write` sends standard-input frames; standard output comes back as `stream/data`,
+  standard error goes to the adapter's log, and `stream/closed` carries the exit code (none
+  for a command a signal ended).
+  execd has no frame that closes only standard input, so `stream/close` sends the command
+  SIGHUP, ends the session after two seconds if it still runs, and closes the socket.
+
+Errors read as `not-found` (HTTP 404); `offline` where OpenSandbox is down — not reached,
+a gateway answering for it (HTTP 502, 503, 504), or no answer in time; `refused` for a
+refused API key (HTTP 401, 403), whose line names `OPENSANDBOX_API_KEY` to give (again);
+`start-failed` (a host that could not be made or resumed); or `refused`.
+
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter opensandbox --setting NAME[=VALUE]` on a computer):
+
+| Setting | | |
+|---|---|---|
+| `OPENSANDBOX_URL` | required | your OpenSandbox server, as its SDKs take it: `http://localhost:8080` |
+| `OPENSANDBOX_API_KEY` | secret, optional | the server's `server.api_key`, where it has one |
+
+It reads them from `initialize` only, never from its environment. Build and check it:
+
+```sh
+cd opensandbox && cargo build && cargo clippy && cargo test
+steery programs test target/debug/steery-adapter-opensandbox \
+  --setting OPENSANDBOX_URL=http://localhost:8080 --setting OPENSANDBOX_API_KEY
+```
+
+The check lists hosts on the server it is given; a local server is the
+`opensandbox/server` image (`opensandbox/server:release-1.1.0`, which runs hosts with
+`opensandbox/execd:v1.1.0`) with the Docker runtime, as its
+`server/docker-compose.example.yaml` sets it up. On a Mac, set the server's `host_ip` to
+`127.0.0.1` rather than the example's `host.docker.internal`: the endpoints the server
+hands out must be reachable from the Mac itself, where the adapter runs, and
+`host.docker.internal` resolves only inside containers.
+
+## atelier
+
+`atelier/` provides `hosts` on [Atelier](https://github.com/frak-id/atelier) (`initialize`
+answers `machine: {provides: "hosts", keeps: "filesystem", idle: "none", optional:
+["pause", "fork"], channel: "argv", os: "linux"}`). It calls Atelier's REST API directly,
+over HTTPS (rustls), as the user its API key is: `/v1` for hosts and the jobs a long change
+runs as, `/api` for that user's SSH keys and the server's settings. Atelier's own words for
+a host (its API paths) stay inside `src/api.rs`, whose items are named by Steery's words
+(`api::Host` is a host as Atelier lists it). It passes no toolbox, environment, secret or
+network setting of its own: a host gets what Atelier gives every host of its user and
+organization.
+
+- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked
+  (`GET /v1/sandboxes?metadata=…&owner=me`). The adapter drops any host lacking a label
+  asked, so a server that ignores the filters never gets `list` or `ensure` an unrelated
+  host; only `owner=me` (an Atelier that has it) restricts the list to the key user's own
+  hosts. An older Atelier ignores `owner` harmlessly.
+- `hosts/ensure`: the host named `steery-<first 128 bits of the key's SHA-256, hex>`, or
+  one made under that name, labelled `steery=host`, `steery-key=<key>` and the labels
+  asked, from the snapshot or image (built `FROM` it) the runtime names, or Daytona's
+  default snapshot, with the environment `DAYTONA_ENV` names (Daytona's `env`, sent only
+  when given), and waited for until it runs. Daytona keeps names unique and reads them
+  back at once, so an ensure sent twice, even at once, makes one host. A host of that name
+  without those labels is refused; one being deleted is waited out.
+- `hosts/start`, `stop`, `delete` and `archive` ask Daytona and wait until the host is
+  `started`, `stopped`, `destroyed` or `archived`, reading it again every second (every
+  two while archiving); `error` or `build_failed` fails. Archive stops a started host
+  first, since Daytona archives only a stopped one. Its filesystem survives a stop and an
+  archive.
+- `hosts/keepalive` refreshes the host's last activity, which auto-stop counts from.
+- `hosts/put` uploads the file (`/files/upload-v2`), reads its size back
+  (`/files/info`) and sets its mode (`/files/permissions`). A file that timed out or came
+  out short is deleted and the put refused; a large file is better fetched from inside.
+- `hosts/channel` is an `argv` channel: `ssh -T` to Daytona's SSH gateway
+  (`ssh.app.daytona.io`, or the host and port Daytona's answer names) with a 60-minute
+  access token, running the runtime's command, quoted for the host's shell.
+
+The channel runs `ssh` on the controlling computer, which carries the command's standard
+input and output byte for byte, so an OpenSSH client there is a prerequisite (`apt install
+openssh-client` on a bare Debian or Ubuntu). Where none is on `PATH`, `initialize` says so
+as `unavailable`, so no machine is added where it cannot work, and `hosts/channel` and
+`hosts/list` — the first call adding a machine makes, so nothing is written — refuse
+`refused`: "Daytona's channel runs `ssh` on this computer, and none is installed: install an
+OpenSSH client (e.g. apt install openssh-client)".
+
+It waits for Daytona inside the runtime's bounds: 280 s for `ensure`, `start`, `archive`
+and `put` (bound 300 s), 55 s for the rest (bound 60 s), and 5 s for each file call after
+an upload. Errors read as `not-found` (HTTP 404); `offline` where Daytona is down — not
+reached, a gateway answering for it (HTTP 502, 503, 504), or a request with no answer in
+its time — a retry the server bounds; `refused` for a refused API key (HTTP 401, 403),
+whose line names the setting to give again (`Daytona refused the API key (HTTP 401: …):
+give DAYTONA_API_KEY again`), since a bad key does not heal by waiting; `start-failed` (a
+host that could not be made or started); or `refused`, which is also a host that did not
+reach the state asked for in time, and a put whose upload got no answer by its bound. Each
+line is Daytona's own message, without the API key.
+
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter daytona --setting NAME[=VALUE]` on a computer):
+
+| Setting | | |
+|---|---|---|
+| `DAYTONA_API_KEY` | secret, required | an API key from <https://app.daytona.io/dashboard/keys> |
+| `DAYTONA_API_URL` | optional | your Daytona API URL, for a self-hosted Daytona; absent: `https://app.daytona.io/api` |
+| `DAYTONA_TARGET` | optional | the region hosts are made in; absent: your organization's default |
+| `DAYTONA_ENV` | secret, optional | environment set on every host it makes, one `NAME=VALUE` per line (blank and `#` lines skipped; the value is everything after the first `=`), passed to Daytona as it is; a malformed line refuses `initialize` naming its line number, never its value |
+
+It reads them from `initialize` only, never from its environment or a file. Build and
+check it:
+
+```sh
+cd daytona && cargo build && cargo clippy && cargo test
+DAYTONA_API_KEY=… steery programs test target/debug/steery-adapter-daytona --setting DAYTONA_API_KEY
+```
+
+With the key, the check also lists your hosts (`hosts/list`); it makes none.
+
+## opensandbox
+
+`opensandbox/` provides `hosts` on [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
+(`initialize` answers `machine: {provides: "hosts", keeps: "filesystem", idle: "ttl",
+optional: ["pause", "keepalive"], channel: "stream", os: "linux"}`). It is a Rust binary,
+`steery-adapter-opensandbox`, speaking the program protocol through `steery-sdk`, and talks
+to OpenSandbox's published lifecycle API and to the execd daemon in each host over HTTP and
+WebSocket (rustls), with no vendor SDK. OpenSandbox's own words for a host (its API paths,
+its key header) stay inside `src/provider.rs`, whose items are named by Steery's words
+(`provider::Found` is a host as the API answers it):
+
+- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked.
+- `hosts/ensure`: finds the host whose metadata holds `steery-key=<key>`, or makes one
+  from the image (`image.uri`) or snapshot (`snapshotId`) the runtime names. OpenSandbox
+  has no default image, so with neither it refuses `no-place`. A host made from an image
+  is given the entrypoint `tail -f /dev/null`, because the API requires one; its resource
+  limits are left empty, so the server's own apply. Metadata keys and values follow
+  Kubernetes label rules (63 characters; letters, digits, `-`, `_`, `.`), so a key or label
+  outside them is refused by the server. OpenSandbox takes no name to make a host by and
+  has nothing to lock on, so ensures for one key run one after the other in the adapter,
+  and after making one it lists the key again: the oldest host, by the creation time the
+  listing reads, is the key's, and a younger one it made is deleted. Two adapters making one
+  at once thus answer one host, as long as the server lists each before the other's
+  create answers (a create still pulling its image is not listed).
+- `hosts/start` resumes a paused host and waits until it runs; `stop` and `pause`
+  pause it (OpenSandbox's only stop that keeps it); `delete` deletes it. Its filesystem
+  survives a pause.
+- `hosts/keepalive` renews the expiration by the TTL the server gave it when it was made
+  (kept in its metadata as `steery-ttl`), or by an hour; a host with no expiration needs
+  none. The adapter sets no timeout of its own, so the server's default is the host's
+  idle timer; on the Docker runtime that default is none, and a host lives until it is
+  deleted.
+- `hosts/put` uploads the file through execd (`/files/upload`) with its mode, then reads
+  its size back (`/files/info`); a file that is not whole is removed before it refuses.
+- `hosts/channel` is a `stream` channel: it opens a pipe-mode PTY session in execd running
+  the command (`POST /pty`) and joins its WebSocket (`/pty/{id}/ws?pty=0`), reached through
+  the host's endpoint for port 44772 and the headers that endpoint names.
+  `stream/write` sends standard-input frames; standard output comes back as `stream/data`,
+  standard error goes to the adapter's log, and `stream/closed` carries the exit code (none
+  for a command a signal ended).
+  execd has no frame that closes only standard input, so `stream/close` sends the command
+  SIGHUP, ends the session after two seconds if it still runs, and closes the socket.
+
+Errors read as `not-found` (HTTP 404); `offline` where OpenSandbox is down — not reached,
+a gateway answering for it (HTTP 502, 503, 504), or no answer in time; `refused` for a
+refused API key (HTTP 401, 403), whose line names `OPENSANDBOX_API_KEY` to give (again);
+`start-failed` (a host that could not be made or resumed); or `refused`.
+
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter opensandbox --setting NAME[=VALUE]` on a computer):
+
+| Setting | | |
+|---|---|---|
+| `OPENSANDBOX_URL` | required | your OpenSandbox server, as its SDKs take it: `http://localhost:8080` |
+| `OPENSANDBOX_API_KEY` | secret, optional | the server's `server.api_key`, where it has one |
+
+It reads them from `initialize` only, never from its environment. Build and check it:
+
+```sh
+cd opensandbox && cargo build && cargo clippy && cargo test
+steery programs test target/debug/steery-adapter-opensandbox \
+  --setting OPENSANDBOX_URL=http://localhost:8080 --setting OPENSANDBOX_API_KEY
+```
+
+The check lists hosts on the server it is given; a local server is the
+`opensandbox/server` image (`opensandbox/server:release-1.1.0`, which runs hosts with
+`opensandbox/execd:v1.1.0`) with the Docker runtime, as its
+`server/docker-compose.example.yaml` sets it up. On a Mac, set the server's `host_ip` to
+`127.0.0.1` rather than the example's `host.docker.internal`: the endpoints the server
+hands out must be reachable from the Mac itself, where the adapter runs, and
+`host.docker.internal` resolves only inside containers.
+
+## atelier
+
+`atelier/` provides `hosts` on [Atelier](https://github.com/frak-id/atelier) (`initialize`
+answers `machine: {provides: "hosts", keeps: "filesystem", idle: "none", optional:
+["pause", "fork"], channel: "argv", os: "linux"}`). It calls Atelier's REST API directly,
+over HTTPS (rustls), as the user its API key is: `/v1` for hosts and the jobs a long change
+runs as, `/api` for that user's SSH keys and the server's settings. Atelier's own words for
+a host (its API paths) stay inside `src/api.rs`, whose items are named by Steery's words
+(`api::Host` is a host as Atelier lists it). It passes no toolbox, environment, secret or
+network setting of its own: a host gets what Atelier gives every host of its user and
+organization.
+
 - `hosts/list`: the key user's own hosts whose metadata holds `steery=host` and every
   label asked (`GET /v1/sandboxes?metadata=…&owner=me`). Hosts that lack a label are
   dropped by the adapter too, so an Atelier that ignores the filters (an older one) never
@@ -377,19 +826,19 @@ there is a prerequisite; where none is on `PATH`, `initialize` says so as `unava
 
 It waits for Atelier inside the runtime's bounds: 280 s for `ensure`, `start` and `put`
 (bound 300 s), 55 s for the rest (bound 60 s). Errors read as `not-found` (HTTP 404, an
-unknown host); `offline` where Atelier is down — not reached, a gateway answering for it
-(HTTP 502, 503, 504), or a request with no answer in its time; `refused` for a refused API
-key (HTTP 401), whose line names `ATELIER_API_KEY` to give again, for a user Atelier denies
-the host or the action (HTTP 403), whose line does not, and for a route this Atelier lacks
-(HTTP 404 `Endpoint not found`), whose line says to update Atelier; `start-failed` (a host
-whose job failed, or that could not be resumed); or `refused`. Each line is Atelier's own
-message, without the API key.
+unknown host, or a 404 that is not Atelier's own JSON); `offline` where Atelier is down —
+not reached, a gateway answering for it (HTTP 502, 503, 504), or a request with no answer
+in its time; `refused` for a refused API key (HTTP 401), whose line names
+`ATELIER_API_KEY` to give again; `refused` for a user Atelier denies the host or the
+action (HTTP 403), whose line does not; `refused` for a route this Atelier lacks (HTTP 404
+`Endpoint not found`), whose line says to update Atelier; `start-failed` (a host whose job
+failed, or that could not be resumed); or `refused`. Each line is Atelier's own message,
+without the API key.
 
-It needs an Atelier with `owner=me` on `GET /v1/sandboxes`, the access rule that answers
-404 for a host its user may not reach, and a fork whose copy can be read at once,
-`creating` (branch `feat/steery-integration`). An older one still serves `list` and
-`ensure` (the adapter filters), but a copy forked there may be 404 until its snapshot is
-done, so `start` on it refuses `not-found`.
+It needs an Atelier that: filters `GET /v1/sandboxes` by `owner=me`; makes a fork's copy
+readable at once, `creating`; and answers 404 for a host its user may not reach. Without
+the first, `list` is every host the key may access that holds the labels; without the
+second, a `fork` that outlasts its time is refused.
 
 Its settings, given once where the machine is added (on Steery's web for a cloud machine,
 or `steery setup --adapter atelier --setting NAME[=VALUE]` on a computer):
