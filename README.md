@@ -339,8 +339,10 @@ a host (its API paths) stay inside `src/api.rs`, whose items are named by Steery
 network setting of its own: a host gets what Atelier gives every host of its user and
 organization.
 
-- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked
-  (`GET /v1/sandboxes?metadata=…`).
+- `hosts/list`: the key user's own hosts whose metadata holds `steery=host` and every
+  label asked (`GET /v1/sandboxes?metadata=…&owner=me`). Hosts that lack a label are
+  dropped by the adapter too, so an Atelier that ignores the filters (an older one) never
+  lists, or ensures, an unrelated host.
 - `hosts/ensure`: the oldest host whose metadata holds `steery-key=<key>`, or one made
   (`POST /v1/sandboxes`) with the labels asked, `steery=host` and `steery-key=<key>` as its
   metadata, from the snapshot or image the runtime names, or the server's
@@ -352,7 +354,12 @@ organization.
   and `pause` pause a running one (`POST …/pause`, Atelier's only stop that keeps it: a
   snapshot of its filesystem); `delete` deletes it.
 - `hosts/fork` makes a new host from a snapshot of the host, with its spec and its labels
-  but its key (`POST …/fork`), and waits for its job and for it to run.
+  but its key and every `atelier.dev/` one (`POST …/fork`), and answers at once with the
+  copy's id from the job (a job already failed or canceled refuses `start-failed`). The
+  copy is `creating` for the minutes its snapshot and boot take, past `fork`'s 60 s bound;
+  `hosts/start` waits for it to run. The protocol does not say the runtime calls
+  `hosts/start` before it uses a forked host, so until it does, the copy may be used while
+  `creating`.
 - `hosts/put` writes a text file through Atelier (`PATCH …/files`, owned by `dev` with the
   mode asked) and reads its size back (`POST …/exec`); a binary file goes over the channel
   into a file beside it, checked whole, given its mode and renamed into place. A file that
@@ -369,12 +376,20 @@ there is a prerequisite; where none is on `PATH`, `initialize` says so as `unava
 `hosts/channel` and `hosts/list` refuse `refused`, as `daytona` does.
 
 It waits for Atelier inside the runtime's bounds: 280 s for `ensure`, `start` and `put`
-(bound 300 s), 55 s for the rest (bound 60 s). Errors read as `not-found` (HTTP 404);
-`offline` where Atelier is down — not reached, a gateway answering for it (HTTP 502, 503,
-504), or a request with no answer in its time; `refused` for a refused API key (HTTP 401,
-403), whose line names `ATELIER_API_KEY` to give again; `start-failed` (a host whose job
-failed, or that could not be resumed); or `refused`. Each line is Atelier's own message,
-without the API key.
+(bound 300 s), 55 s for the rest (bound 60 s). Errors read as `not-found` (HTTP 404, an
+unknown host); `offline` where Atelier is down — not reached, a gateway answering for it
+(HTTP 502, 503, 504), or a request with no answer in its time; `refused` for a refused API
+key (HTTP 401), whose line names `ATELIER_API_KEY` to give again, for a user Atelier denies
+the host or the action (HTTP 403), whose line does not, and for a route this Atelier lacks
+(HTTP 404 `Endpoint not found`), whose line says to update Atelier; `start-failed` (a host
+whose job failed, or that could not be resumed); or `refused`. Each line is Atelier's own
+message, without the API key.
+
+It needs an Atelier with `owner=me` on `GET /v1/sandboxes`, the access rule that answers
+404 for a host its user may not reach, and a fork whose copy can be read at once,
+`creating` (branch `feat/steery-integration`). An older one still serves `list` and
+`ensure` (the adapter filters), but a copy forked there may be 404 until its snapshot is
+done, so `start` on it refuses `not-found`.
 
 Its settings, given once where the machine is added (on Steery's web for a cloud machine,
 or `steery setup --adapter atelier --setting NAME[=VALUE]` on a computer):

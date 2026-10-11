@@ -23,9 +23,14 @@ const POLL: Duration = Duration::from_secs(1);
 pub enum Fault {
     /// Atelier has no such host or job (HTTP 404).
     NotFound(String),
-    /// Atelier refused the API key (HTTP 401, 403), and what it said: a key that does not
-    /// heal by waiting, given again by the person.
+    /// Atelier refused the API key (HTTP 401), and what it said: a key that does not heal
+    /// by waiting, given again by the person.
     KeyRefused { status: u16, said: String },
+    /// Atelier knows the key and denies this user the host or the action (HTTP 403), and
+    /// what it said. The key is not at fault.
+    Forbidden(String),
+    /// Atelier has no such route (HTTP 404 `Endpoint not found`): an older Atelier.
+    NoRoute(String),
     /// Atelier is down: not reached, a gateway that answers for it (HTTP 502, 503, 504),
     /// or a request that got no answer in its time.
     Offline(String),
@@ -233,17 +238,26 @@ impl Atelier {
             .timeout(deadline.within()?))
     }
 
-    /// Every host whose metadata holds all of `labels`.
+    /// Every host of the key's user whose metadata holds all of `labels`. An Atelier that
+    /// ignores `metadata` or `owner` lists more; the hosts that lack a label are dropped
+    /// here.
     pub async fn list(
         &self,
         labels: &BTreeMap<String, String>,
         deadline: Deadline,
     ) -> Result<Vec<Host>, Fault> {
-        let labels = serde_json::to_string(labels).map_err(|e| Fault::Failed(e.to_string()))?;
+        let asked = labels;
+        let labels = serde_json::to_string(asked).map_err(|e| Fault::Failed(e.to_string()))?;
         let request = self
             .call(Method::GET, "/v1/sandboxes", deadline)?
-            .query(&[("metadata", labels)]);
-        json(send(request).await?).await
+            .query(&[("metadata", labels.as_str()), ("owner", "me")]);
+        let mut hosts: Vec<Host> = json(send(request).await?).await?;
+        hosts.retain(|host| {
+            asked
+                .iter()
+                .all(|(name, value)| host.metadata.get(name) == Some(value))
+        });
+        Ok(hosts)
     }
 
     pub async fn get(&self, id: &str, deadline: Deadline) -> Result<Found, Fault> {
@@ -334,6 +348,23 @@ impl Atelier {
                     "type": "generated",
                 }));
         send(request).await.map(drop)
+    }
+
+    /// The id of the host a job makes, as soon as the job names it: Atelier picks it before
+    /// the job runs, and the host can be read at once, `creating`. A job already failed or
+    /// canceled is a fault.
+    pub fn started(job: &Job) -> Result<String, Fault> {
+        let host = job.host()?;
+        match job.status.as_str() {
+            "failed" | "canceled" => {
+                let why = job.error.as_deref().unwrap_or("no reason given");
+                Err(Fault::Failed(format!(
+                    "making host {host} {}: {why}",
+                    job.status
+                )))
+            }
+            _ => Ok(host),
+        }
     }
 
     /// Reads job `id` until it is done; the host it made once it succeeded.
@@ -446,11 +477,13 @@ async fn send(request: RequestBuilder) -> Result<Response, Fault> {
 fn fault(status: StatusCode, message: String) -> Fault {
     let line = format!("{message} (HTTP {})", status.as_u16());
     match status {
+        StatusCode::NOT_FOUND if message == "Endpoint not found" => Fault::NoRoute(line),
         StatusCode::NOT_FOUND => Fault::NotFound(line),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Fault::KeyRefused {
-            status: status.as_u16(),
+        StatusCode::UNAUTHORIZED => Fault::KeyRefused {
+            status: 401,
             said: message,
         },
+        StatusCode::FORBIDDEN => Fault::Forbidden(line),
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
             Fault::Offline(line)
         }
@@ -510,6 +543,13 @@ pub mod tests {
     pub async fn atelier_answering(
         answer: impl Fn(&str) -> Option<(u16, String)> + Send + 'static,
     ) -> String {
+        atelier_reading(move |line, _| answer(line)).await
+    }
+
+    /// As [`atelier_answering`], and `answer` gets the request's body too.
+    pub async fn atelier_reading(
+        answer: impl Fn(&str, &str) -> Option<(u16, String)> + Send + 'static,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -517,16 +557,27 @@ pub mod tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 4096];
-                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                let body = loop {
+                    if let Some(end) = request.windows(4).position(|end| end == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break String::from_utf8_lossy(&request[end + 4..]).into_owned();
+                        }
+                    }
                     match socket.read(&mut chunk).await {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) | Err(_) => break String::new(),
                         Ok(read) => request.extend_from_slice(&chunk[..read]),
                     }
-                }
+                };
                 let text = String::from_utf8_lossy(&request);
                 let line = text.lines().next().unwrap_or("");
                 let line = line.rsplit_once(' ').map_or(line, |(line, _)| line);
-                match answer(line) {
+                match answer(line, &body) {
                     Some((status, body)) => {
                         let reply = format!(
                             "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -568,15 +619,52 @@ pub mod tests {
 
     #[tokio::test]
     async fn a_refused_key_and_other_answers_read_as_their_faults() {
-        for status in [401, 403] {
-            let fault = fault_of(Some(status)).await;
+        let fault = fault_of(Some(401)).await;
+        assert!(
+            matches!(&fault, Fault::KeyRefused { status: 401, said } if said == "said"),
+            "{fault:?}"
+        );
+        let fault = fault_of(Some(403)).await;
+        assert!(
+            matches!(&fault, Fault::Forbidden(line) if line == "said (HTTP 403)"),
+            "{fault:?}"
+        );
+        assert!(matches!(fault_of(Some(404)).await, Fault::NotFound(_)));
+        assert!(matches!(fault_of(Some(409)).await, Fault::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_is_no_route_and_an_unknown_host_not_found() {
+        let url = atelier_answering(|_| {
+            Some((
+                404,
+                r#"{"error":"NOT_FOUND","message":"Endpoint not found"}"#.to_owned(),
+            ))
+        })
+        .await;
+        let atelier = Atelier::new(&url, "atl_x".into()).unwrap();
+        let fault = atelier.get("s", Deadline::after(1)).await.unwrap_err();
+        assert!(matches!(&fault, Fault::NoRoute(_)), "{fault:?}");
+    }
+
+    #[test]
+    fn a_job_names_its_host_at_once_unless_it_failed() {
+        let job = |status: &str| Job {
+            id: "j".into(),
+            status: status.into(),
+            metadata: BTreeMap::from([("sandboxId".to_owned(), "s2".to_owned())]),
+            error: Some("no space".into()),
+        };
+        for status in ["pending", "running", "succeeded"] {
+            assert_eq!(Atelier::started(&job(status)).unwrap(), "s2");
+        }
+        for status in ["failed", "canceled"] {
+            let fault = Atelier::started(&job(status)).unwrap_err();
             assert!(
-                matches!(&fault, Fault::KeyRefused { status: got, said } if *got == status && said == "said"),
+                matches!(&fault, Fault::Failed(line) if line.contains("no space")),
                 "{fault:?}"
             );
         }
-        assert!(matches!(fault_of(Some(404)).await, Fault::NotFound(_)));
-        assert!(matches!(fault_of(Some(409)).await, Fault::Failed(_)));
     }
 
     #[test]
