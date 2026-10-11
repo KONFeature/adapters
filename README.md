@@ -1,8 +1,9 @@
 # Steery adapters
 
 An adapter connects [Steery](https://steery.dev) to one kind of machine: an operating system
-(`macos`, `linux`) or a vendor's service that makes hosts (`daytona`, `opensandbox`): a
-machine whose adapter makes hosts runs each conversation in a host of its own. The Steery runtime
+(`macos`, `linux`) or a vendor's service that makes hosts (`daytona`, `opensandbox`,
+`atelier`): a machine whose adapter makes hosts runs each conversation in a host of its
+own. The Steery runtime
 starts an adapter as a child process and speaks the program protocol to it, JSON-RPC 2.0
 over standard input and output (`PROTOCOL.md` in
 [steery-dev/sdk](https://github.com/steery-dev/sdk)). Drivers, one
@@ -22,6 +23,7 @@ macos/       steery-adapter-macos: processes on macOS
 linux/       steery-adapter-linux: processes on Linux
 daytona/     steery-adapter-daytona: hosts on Daytona
 opensandbox/ steery-adapter-opensandbox: hosts on OpenSandbox
+atelier/     steery-adapter-atelier: hosts on Atelier
 ```
 
 Each crate is a Cargo workspace of its own, with its own `Cargo.lock`, so it builds alone.
@@ -44,7 +46,7 @@ cd adapters/linux && cargo build
 ```
 
 `./release.sh <tag>` builds every adapter with `--release --locked` with `cargo zigbuild`,
-into `dist/<target>/`: `daytona` and `opensandbox` for each target Steery runs on,
+into `dist/<target>/`: `daytona`, `opensandbox` and `atelier` for each target Steery runs on,
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu` (the Linux builds linking glibc 2.30 at most); `macos` for the
 two Apple targets only, and `linux` for the two Linux targets only. It then packs them into
@@ -67,8 +69,8 @@ method it does not have, and its shutdown, one line per check; it exits 0 only w
 one passes. A read answered with a refusal word its method lists is an answer.
 `--setting NAME=VALUE` passes a setting to `initialize`, and `--setting NAME` takes its
 value from the environment, keeping a secret off the command line; a method that needs a
-required setting not given is skipped. `daytona` and `opensandbox` also have their own
-`cargo test`.
+required setting not given is skipped. `daytona`, `opensandbox` and `atelier` also have
+their own `cargo test`.
 
 ## Writing an adapter
 
@@ -322,6 +324,71 @@ The check lists hosts on the server it is given; a local server is the
 `127.0.0.1` rather than the example's `host.docker.internal`: the endpoints the server
 hands out must be reachable from the Mac itself, where the adapter runs, and
 `host.docker.internal` resolves only inside containers.
+
+## atelier
+
+`atelier/` provides `hosts` on [Atelier](https://github.com/frak-id/atelier) (`initialize`
+answers `machine: {provides: "hosts", keeps: "filesystem", idle: "none", optional:
+["pause", "fork"], channel: "argv", os: "linux"}`). It calls Atelier's REST API directly,
+over HTTPS (rustls), as the user its API key is: `/v1` for hosts and the jobs a long change
+runs as, `/api` for that user's SSH keys and the server's settings. Atelier's own words for
+a host (its API paths) stay inside `src/api.rs`, whose items are named by Steery's words
+(`api::Host` is a host as Atelier lists it). It passes no toolbox, environment, secret or
+network setting of its own: a host gets what Atelier gives every host of its user and
+organization.
+
+- `hosts/list`: the hosts whose metadata holds `steery=host` and every label asked
+  (`GET /v1/sandboxes?metadata=…`).
+- `hosts/ensure`: the oldest host whose metadata holds `steery-key=<key>`, or one made
+  (`POST /v1/sandboxes`) with the labels asked, `steery=host` and `steery-key=<key>` as its
+  metadata, from the snapshot or image the runtime names, or the server's
+  `sandbox.defaultImage`; its job is read (`GET /v1/jobs/:id`) until it is done and the
+  host until it is `running`. Atelier takes no name to make a host by, so ensures for one
+  key run one after the other in the adapter, and after making one it lists the key again:
+  the oldest host is the key's, and a younger one it made is deleted.
+- `hosts/start` resumes a paused host (`POST …/resume`) and waits until it runs; `stop`
+  and `pause` pause a running one (`POST …/pause`, Atelier's only stop that keeps it: a
+  snapshot of its filesystem); `delete` deletes it.
+- `hosts/fork` makes a new host from a snapshot of the host, with its spec and its labels
+  but its key (`POST …/fork`), and waits for its job and for it to run.
+- `hosts/put` writes a text file through Atelier (`PATCH …/files`, owned by `dev` with the
+  mode asked) and reads its size back (`POST …/exec`); a binary file goes over the channel
+  into a file beside it, checked whole, given its mode and renamed into place. A file that
+  did not arrive whole is removed before the put refuses.
+- `hosts/channel` is an `argv` channel: `ssh -T` with the adapter's key to the SSH
+  endpoint Atelier gives the host (`ssh <host id>@<gateway> [-p <port>]`; the host's id
+  at `ATELIER_URL`'s host where it gives none), running the runtime's command, quoted for
+  the host's shell. The key is an ed25519 key the adapter makes once with `ssh-keygen`, in
+  `atelier/id_ed25519` under the runtime's config folder, and registers as one of the user's
+  SSH keys (`POST /api/ssh-keys`, named `steery`) the first time a run needs it.
+
+The channel runs `ssh` and `ssh-keygen` on the controlling computer, so an OpenSSH client
+there is a prerequisite; where none is on `PATH`, `initialize` says so as `unavailable`, and
+`hosts/channel` and `hosts/list` refuse `refused`, as `daytona` does.
+
+It waits for Atelier inside the runtime's bounds: 280 s for `ensure`, `start` and `put`
+(bound 300 s), 55 s for the rest (bound 60 s). Errors read as `not-found` (HTTP 404);
+`offline` where Atelier is down — not reached, a gateway answering for it (HTTP 502, 503,
+504), or a request with no answer in its time; `refused` for a refused API key (HTTP 401,
+403), whose line names `ATELIER_API_KEY` to give again; `start-failed` (a host whose job
+failed, or that could not be resumed); or `refused`. Each line is Atelier's own message,
+without the API key.
+
+Its settings, given once where the machine is added (on Steery's web for a cloud machine,
+or `steery setup --adapter atelier --setting NAME[=VALUE]` on a computer):
+
+| Setting | | |
+|---|---|---|
+| `ATELIER_URL` | required | your Atelier server: `https://atelier.example.com` |
+| `ATELIER_API_KEY` | secret, required | an Atelier API key (`atl_…`) |
+
+It reads them from `initialize` only, never from its environment. Build and check it:
+
+```sh
+cd atelier && cargo build && cargo clippy && cargo test
+steery programs test target/debug/steery-adapter-atelier \
+  --setting ATELIER_URL=http://localhost:3000 --setting ATELIER_API_KEY
+```
 
 ## What Steery adds to a host
 
