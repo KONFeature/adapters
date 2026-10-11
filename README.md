@@ -197,7 +197,8 @@ and leaves Daytona's auto-stop as the host's idle timer.
 - `hosts/ensure`: the host named `steery-<first 128 bits of the key's SHA-256, hex>`, or
   one made under that name, labelled `steery=host`, `steery-key=<key>` and the labels
   asked, from the snapshot or image (built `FROM` it) the runtime names, or Daytona's
-  default snapshot, and waited for until it runs. Daytona keeps names unique and reads them
+  default snapshot, with the environment `DAYTONA_ENV` names (Daytona's `env`, sent only
+  when given), and waited for until it runs. Daytona keeps names unique and reads them
   back at once, so an ensure sent twice, even at once, makes one host. A host of that name
   without those labels is refused; one being deleted is waited out.
 - `hosts/start`, `stop`, `delete` and `archive` ask Daytona and wait until the host is
@@ -240,6 +241,7 @@ or `steery setup --adapter daytona --setting NAME[=VALUE]` on a computer):
 | `DAYTONA_API_KEY` | secret, required | an API key from <https://app.daytona.io/dashboard/keys> |
 | `DAYTONA_API_URL` | optional | your Daytona API URL, for a self-hosted Daytona; absent: `https://app.daytona.io/api` |
 | `DAYTONA_TARGET` | optional | the region hosts are made in; absent: your organization's default |
+| `DAYTONA_ENV` | secret, optional | environment set on every host it makes, one `NAME=VALUE` per line (blank and `#` lines skipped; the value is everything after the first `=`), passed to Daytona as it is; a malformed line refuses `initialize` naming its line number, never its value |
 
 It reads them from `initialize` only, never from its environment or a file. Build and
 check it:

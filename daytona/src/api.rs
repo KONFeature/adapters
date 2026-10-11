@@ -84,6 +84,26 @@ pub struct Create<'a> {
     pub build_info: Option<BuildInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<&'a str>,
+    #[serde(skip_serializing_if = "Env::is_empty")]
+    pub env: &'a Env,
+}
+
+/// The environment every host is made with, as the person's `DAYTONA_ENV` names it. Its
+/// values may be secrets: `Debug` shows the names only.
+#[derive(Default, Serialize)]
+#[serde(transparent)]
+pub struct Env(pub BTreeMap<String, String>);
+
+impl Env {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
 }
 
 /// An image to build a host from: Daytona builds it from a Dockerfile.
@@ -154,10 +174,16 @@ pub struct Daytona {
     api: String,
     key: String,
     target: Option<String>,
+    env: Env,
 }
 
 impl Daytona {
-    pub fn new(key: String, api: Option<&str>, target: Option<String>) -> Result<Self, String> {
+    pub fn new(
+        key: String,
+        api: Option<&str>,
+        target: Option<String>,
+        env: Env,
+    ) -> Result<Self, String> {
         let http = reqwest::Client::builder()
             .user_agent(concat!(
                 "steery-adapter-daytona/",
@@ -171,6 +197,7 @@ impl Daytona {
             api,
             key,
             target,
+            env,
         })
     }
 
@@ -181,6 +208,10 @@ impl Daytona {
 
     pub fn target(&self) -> Option<&str> {
         self.target.as_deref()
+    }
+
+    pub fn env(&self) -> &Env {
+        &self.env
     }
 
     fn request(&self, method: Method, url: &str, within: Duration) -> RequestBuilder {
@@ -526,7 +557,7 @@ pub mod tests {
 
     async fn fault_of(status: Option<u16>) -> Fault {
         let url = daytona_answering(status, r#"{"message":"said"}"#).await;
-        let daytona = Daytona::new("sk".into(), Some(&url), None).unwrap();
+        let daytona = Daytona::new("sk".into(), Some(&url), None, Env::default()).unwrap();
         let request = daytona.request(Method::GET, &url, Duration::from_millis(300));
         send(request).await.unwrap_err()
     }
