@@ -2,7 +2,8 @@
 
 An adapter connects [Steery](https://steery.dev) to one kind of machine: an operating system
 (`macos`, `linux`) or a vendor's service that makes hosts (`daytona`, `opensandbox`): a
-machine whose adapter makes hosts runs each conversation in a host of its own. The Steery runtime
+machine whose adapter makes hosts runs each conversation in a host of its own. The Steery
+runtime
 starts an adapter as a child process and speaks the program protocol to it, JSON-RPC 2.0
 over standard input and output (`PROTOCOL.md` in
 [steery-dev/sdk](https://github.com/steery-dev/sdk)). Drivers, one
