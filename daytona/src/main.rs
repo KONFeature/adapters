@@ -3,9 +3,10 @@
 //! paths) stay inside [`api`], which names the items around them by Steery's.
 //!
 //! Its client is built from the settings `initialize` passes, and from nothing else: the
-//! host, its image, credentials and network are the company's and Daytona's, so no host is
-//! given an image, environment, secret or network setting of the adapter's own, and
-//! Daytona's auto-stop stays the host's idle timer.
+//! host, its image, credentials and network are the company's and Daytona's. The one
+//! environment a host is given is the person's own `DAYTONA_ENV`, passed to Daytona as it
+//! is; the adapter adds no image, environment, secret or network of its own, and Daytona's
+//! auto-stop stays the host's idle timer.
 
 mod api;
 
@@ -21,7 +22,7 @@ use sha2::{Digest, Sha256};
 use steery_sdk::wire::{self, hosts};
 use steery_sdk::{Error, PROTOCOL, Program, method, refusal};
 
-use api::{BuildInfo, Create, Daytona, Deadline, Fault};
+use api::{BuildInfo, Create, Daytona, Deadline, Env, Fault};
 
 /// The label every host this adapter makes carries, and every list is filtered by.
 const MINE: (&str, &str) = ("steery", "host");
@@ -92,12 +93,17 @@ impl Program for Adapter {
             )));
         }
         let given = |name: &str| params.settings.get(name).filter(|value| !value.is_empty());
+        let env = match given("DAYTONA_ENV") {
+            Some(lines) => env_of(lines).map_err(|why| Error::refused(refusal::REFUSED, why))?,
+            None => Env::default(),
+        };
         let daytona = match given("DAYTONA_API_KEY") {
             Some(key) => Some(
                 Daytona::new(
                     key.clone(),
                     given("DAYTONA_API_URL").map(String::as_str),
                     given("DAYTONA_TARGET").cloned(),
+                    env,
                 )
                 .map_err(|why| Error::refused(refusal::REFUSED, format!("Daytona: {why}")))?,
             ),
@@ -147,6 +153,12 @@ impl Program for Adapter {
                     false,
                     "The Daytona region hosts are made in (us, eu); absent: your organization's default",
                 ),
+                setting(
+                    "DAYTONA_ENV",
+                    true,
+                    false,
+                    "Environment for every sandbox, one NAME=VALUE per line (# comments); passed as Daytona's env",
+                ),
             ],
         })
     }
@@ -189,6 +201,37 @@ fn setting(name: &str, secret: bool, required: bool, about: &str) -> wire::Setti
         required,
         about: about.into(),
     }
+}
+
+/// The environment `DAYTONA_ENV` names: one `NAME=VALUE` per line, blank lines and `#`
+/// lines skipped; the value is everything after the first `=`, as it is. A malformed line
+/// is refused by its number, never its text, which may hold a secret.
+fn env_of(lines: &str) -> Result<Env, String> {
+    let mut env = BTreeMap::new();
+    for (at, line) in lines.lines().enumerate() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let number = at + 1;
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("DAYTONA_ENV line {number} has no `=`: write NAME=VALUE"))?;
+        let named = name
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !named {
+            return Err(format!(
+                "DAYTONA_ENV line {number}: a name is letters, digits and _, not starting with a digit"
+            ));
+        }
+        env.insert(name.to_owned(), value.to_owned());
+    }
+    Ok(Env(env))
 }
 
 /// The refusal a fault is; `otherwise` where it is none of not found, key, down or time.
@@ -298,6 +341,7 @@ async fn ensure(daytona: &Daytona, params: hosts::Ensure) -> Result<hosts::Named
         snapshot,
         build_info,
         target: daytona.target(),
+        env: daytona.env(),
     };
     let ensured = async {
         loop {
@@ -605,7 +649,7 @@ mod tests {
     /// `status` with `body`.
     async fn listed(status: u16, body: &'static str) -> (String, String) {
         let url = api::tests::daytona_answering(Some(status), body).await;
-        let daytona = Daytona::new("sk-secret".into(), Some(&url), None).unwrap();
+        let daytona = Daytona::new("sk-secret".into(), Some(&url), None, Env::default()).unwrap();
         match list(&daytona, hosts::List { labels: None }).await {
             Err(Error::Refused { word, line }) => (word, line.unwrap_or_default()),
             other => panic!("{other:?}"),
@@ -707,5 +751,43 @@ mod tests {
         std::fs::set_permissions(held.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(ssh_within(&path(&[&empty, &held])));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_daytona_env_line_by_line_and_never_says_a_value() {
+        let env = env_of("# sign-ins\n\nA=1\r\n  B_2=x=y; z \nEMPTY=\n").unwrap();
+        assert_eq!(
+            env.0,
+            BTreeMap::from([
+                ("A".into(), "1".into()),
+                ("B_2".into(), "x=y; z ".into()),
+                ("EMPTY".into(), String::new()),
+            ])
+        );
+        assert_eq!(format!("{env:?}"), r#"{"A", "B_2", "EMPTY"}"#);
+        let why = env_of("A=1\nsecret-value\n").unwrap_err();
+        assert!(why.contains("line 2") && !why.contains("secret"), "{why}");
+        let why = env_of("A=1\n\n9X=secret\n").unwrap_err();
+        assert!(why.contains("line 3") && !why.contains("secret"), "{why}");
+    }
+
+    /// The create body carries `env` only when the person gave one.
+    #[test]
+    fn the_create_body_carries_env_only_when_given() {
+        let labels = BTreeMap::new();
+        let body = |env: &Env| {
+            serde_json::to_value(Create {
+                name: "n",
+                labels: &labels,
+                snapshot: None,
+                build_info: None,
+                target: None,
+                env,
+            })
+            .unwrap()
+        };
+        assert_eq!(body(&Env::default()).get("env"), None);
+        let env = env_of("K=v").unwrap();
+        assert_eq!(body(&env)["env"], serde_json::json!({"K": "v"}));
     }
 }
